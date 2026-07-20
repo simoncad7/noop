@@ -748,7 +748,16 @@ public final class OuraLiveSource: NSObject, ObservableObject {
 
             case .ibi(let ibi):
                 if feedsLive { live.setRRIntervals([ibi.ibiMs]) }
-                enqueue([e], ts: now)
+                // A banked IBI is history data: anchor it to its REAL ring-time, exactly like the sibling
+                // banked streams (.hrv/.temp/.spo2/.sleepPhase) below — never the drain-arrival `now`.
+                // Stamping it at `now` (52b6e88d) misfiled every overnight beat to the daytime sync moment,
+                // so the sleep window ended up with zero R-R -> no restingHr/avgHrv for the night.
+                if let ts = driver.unixSeconds(forRingTimestamp: ibi.ringTimestamp) {
+                    enqueue([e], ts: ts)
+                    noteStoredHistoryRingTime(ibi.ringTimestamp)
+                } else {
+                    pendingAnchorEvents.append((e, ibi.ringTimestamp))
+                }
 
             case .battery(let bat):
                 batteryPct = bat.percent

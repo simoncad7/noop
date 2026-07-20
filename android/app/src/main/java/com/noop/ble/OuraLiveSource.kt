@@ -1114,7 +1114,11 @@ class OuraLiveSource(
             is OuraEvent.Ibi -> {
                 val rr = e.value.ibiMs
                 if (rr in 250..3000) handler.post { guardedCallback("live-sink") { liveSink(0, listOf(rr)) } }
-                enqueue(listOf(e), now)
+                // A banked IBI is history data: anchor it to its REAL ring-time (via [enqueueAnchoredOrPark]),
+                // exactly like the sibling banked streams (.Hrv/.Temp/.Spo2/.SleepPhaseEvent) - never the
+                // drain-arrival `now`. Stamping at `now` misfiled every overnight beat to the daytime sync
+                // moment, so the sleep window ended up with zero R-R -> no restingHr/avgHrv for the night.
+                enqueueAnchoredOrPark(e, e.value.ringTimestamp, d)
             }
             is OuraEvent.Battery -> {
                 handleBattery(e.value.percent)
