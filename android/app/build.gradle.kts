@@ -144,6 +144,14 @@ android {
     }
 }
 
+// Resolve every external module to the exact version recorded in app/gradle.lockfile. Direct
+// dependencies are already pinned below; this also freezes the transitive graph selected through
+// AndroidX POMs and the Compose BOM. Update intentionally with `./gradlew :app:dependencies
+// --write-locks` and review the lockfile diff alongside the dependency declaration change (#658).
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 dependencies {
     // --- Compose (BOM pins all Compose artifact versions in lockstep) ---
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
