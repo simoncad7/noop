@@ -749,6 +749,8 @@ public final class BLEManager: NSObject, ObservableObject {
     /// readable and avoid forcing SwiftUI to auto-scroll on every ACK row.
     private var historicalAckLogCounter = 0
     private var clockRequested = false
+    /// #700: retry count for GET_CLOCK when no correlation establishes before backfill. Capped at 3.
+    private var clockRetries = 0
     private var intentionalDisconnect = false
     /// Consecutive `didFailToConnect` count, for the auto-reconnect backoff (#414). Reset to 0 on a
     /// successful connect; grows the reschedule delay so a strap that's genuinely out of range doesn't
@@ -1573,6 +1575,27 @@ public final class BLEManager: NSObject, ObservableObject {
     /// flag, kick the strap with sendHistoricalData, and arm the idle timeout.
     @discardableResult
     private func beginBackfill() -> Bool {
+        // #700: if backfill is about to start and we STILL have no clock correlation, re-send
+        // GET_CLOCK. The strap may have silently dropped the first response (observed on a reporter's
+        // WHOOP 4.0 — GET_CLOCK sent, no reply, entire session decodes under IDENTITY fallback, all
+        // rows land on the current day). Capped at 3 retries to avoid flooding.
+        if clockRef == nil && clockRetries < 3 {
+            clockRetries += 1
+            log("Clock: no correlation yet — re-sending GET_CLOCK (retry \(clockRetries)/3)")
+            send(.getClock, payload: [])
+            send(.getClock, payload: [0x00])
+        } else if clockRef == nil, let newest = strapNewestTs {
+            // #700 fallback: GET_CLOCK never responded even after retries. Derive a rough correlation
+            // from the Data Range's newest-banked timestamp (already parsed, always answered). The
+            // offset is approximate (the newest record could be minutes old) but vastly better than
+            // identity (offset 0), which mis-dates entire nights.
+            let wall = Int(Date().timeIntervalSince1970)
+            let ref = ClockRef(device: newest, wall: wall)
+            clockRef = ref
+            collector?.clockRef = ref
+            backfiller?.clockRef = ref
+            log("Clock: GET_CLOCK unresponsive — derived rough correlation from Data Range (device=\(newest) wall=\(wall), offset \(wall - newest)s)")
+        }
         // Never offload before the connect handshake has run: a racing foreground/restore trigger
         // firing SEND_HISTORICAL ahead of hello/SET_CLOCK was part of the storm that stopped serving.
         guard connectHandshakeDone else {
@@ -3396,6 +3419,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         realtimeArmed = false
         whoop5SessionStarted = false
         clockRequested = false
+        clockRetries = 0
         connectHandshakeDone = false
         cmdNotifyConfirmedActive = false   // #34: a fresh connection needs its own notify-confirm + settle
         connectSettledSignaled = false
@@ -3566,6 +3590,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         // clockRef is nil in the fresh process after restore, so we must re-request it.
         // Reset the flag so the post-restore didWriteValueFor issues exactly one getClock.
         clockRequested = false
+        clockRetries = 0
         // Ensure the store is ready before restored BLE data arrives (idempotent; no-op if already built).
         Task { @MainActor in await bootstrapStore() }
         if p.state == .connected {
@@ -4144,7 +4169,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                         clockRef = ref
                         collector?.clockRef = ref                  // unblocks buffered persistence
                         backfiller?.clockRef = ref                 // unblocks historical chunk decode
-                        log("Clock correlated: device=\(ref.device) wall=\(ref.wall)")
+                        log("Clock correlated: device=\(ref.device) wall=\(ref.wall)\(clockRetries > 0 ? " (after retry \(clockRetries))" : "")")
                         // Conditional SET_CLOCK (mirrors WHOOP): only when the strap RTC has drifted /
                         // is frozen — not blindly every connect. Offload doesn't depend on this (it uses
                         // clockRef for decoding); SET_CLOCK only keeps FUTURE logging timestamps sane.
