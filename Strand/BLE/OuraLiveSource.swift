@@ -94,6 +94,20 @@ public final class OuraLiveSource: NSObject, ObservableObject {
     /// OURA_PROTOCOL.md s3.2. This is the install-ack the adopt key-install awaits.
     private static let setAuthKeyRespOp: UInt8 = 0x25
 
+    /// Outer-frame ops a GetProductInfo (`0x18`) reply can arrive under. The request op is `0x18`; by the
+    /// request→response +1 convention seen elsewhere (GetBattery `0x0C` request → `0x0D` reply) the reply may
+    /// be `0x19`. We capture both so the fixture lands whatever the firmware uses (#771/#772 capture). Neither
+    /// is an event tag (tags are ≥ 0x41), so peeking them never disturbs the TLV decode.
+    private static let productInfoResponseOps: Set<UInt8> = [0x18, 0x19]
+
+    /// A GetProductInfo string is a usable ring SERIAL only when it is plain alphanumeric and a sane length —
+    /// so a misframed/garbage reply can never mint a bogus `oura-<serial>` identity (#771 honest-data guard).
+    /// The captured Gen3 serial "2H3B2405003655" (14 chars) passes; the hardware id "BLB_03" (underscore) does
+    /// not — but it is already routed to the generation path before this is reached.
+    private static func isPlausibleSerial(_ s: String) -> Bool {
+        (8...24).contains(s.count) && s.allSatisfy { $0.isLetter || $0.isNumber }
+    }
+
     /// Local-time formatter for logging a decoded date/time next to a raw ring-tick cursor value, so a
     /// number like "1178203" reads as an actual date instead of an opaque tick count. Logging only.
     private static let cursorDateFormatter: DateFormatter = {
@@ -125,6 +139,14 @@ public final class OuraLiveSource: NSObject, ObservableObject {
     private let persistSleepSession: (CachedSleepSession) -> Void
     private let log: (String) -> Void
     private let onBattery: (Int) -> Void
+    /// Fired with the ring's TRUE model label ("Oura Ring 3/4/5") once the GetProductInfo hardware id resolves
+    /// a generation on connect, so the app can correct a registry row mis-stamped from the advertised name
+    /// (#772). Default no-op (the discovery-only scanner and unit paths don't correct anything).
+    private let onModel: (String) -> Void
+    /// Fired with the ring's STABLE serial (e.g. "2H3B2405003655") once the GetProductInfo serial page is read
+    /// on connect, so the app can re-point this device onto its `oura-<serial>` id — the identity that survives
+    /// a re-pair, unlike the CoreBluetooth UUID (#771). Default no-op. Only plausible serials are surfaced.
+    private let onSerial: (String) -> Void
     /// The ring generation (carried on `PairedDevice.model`, recovered via `OuraRingGen.from(model:)`).
     /// Selects the MTU clamp, which characteristics to discover, and the live-HR command set.
     private let ringGen: OuraRingGen
@@ -195,6 +217,11 @@ public final class OuraLiveSource: NSObject, ObservableObject {
     /// Feature ids whose status we have already logged this session (SpO2 0x04 / real_steps 0x0b), so the
     /// read-only feature-status diagnostic prints once per feature, not on every reconnect.
     private var loggedFeatureStatuses: Set<Int> = []
+    /// Product-info replies already logged this session, keyed by op+body so the #771/#772 serial/hardware
+    /// capture prints each DISTINCT reply once — get_serial and get_hardware both answer under op 0x19, so a
+    /// per-op guard would swallow the second (observed on-device: only the serial reached the log). Distinct
+    /// bodies each log once; identical re-serves are suppressed. Reset on stop/disconnect.
+    private var loggedProductInfo: Set<String> = []
 
     /// 0x71 green_ibi_amp fixture capture (upstream #287/#333): EVERY occurrence is logged with its
     /// anchored time + envelope rt + length + full raw bytes (a verified decoder needs several real
@@ -727,6 +754,8 @@ public final class OuraLiveSource: NSObject, ObservableObject {
                 persistSleepSession: @escaping (CachedSleepSession) -> Void = { _ in },
                 log: @escaping (String) -> Void = { _ in },
                 onBattery: @escaping (Int) -> Void = { _ in },
+                onModel: @escaping (String) -> Void = { _ in },
+                onSerial: @escaping (String) -> Void = { _ in },
                 feedsLive: Bool = true,
                 adoptIntent: Bool = false) {
         self.live = live
@@ -737,6 +766,8 @@ public final class OuraLiveSource: NSObject, ObservableObject {
         self.persistSleepSession = persistSleepSession
         self.log = log
         self.onBattery = onBattery
+        self.onModel = onModel
+        self.onSerial = onSerial
         self.feedsLive = feedsLive
         self.adoptIntent = adoptIntent
         // Tier-B MET research corpus: only on a live/persisting source, never the discovery-only scanner.
@@ -833,6 +864,7 @@ public final class OuraLiveSource: NSObject, ObservableObject {
         loggedAnchor = false
         loggedTierBKinds.removeAll()
         loggedFeatureStatuses.removeAll()
+        loggedProductInfo.removeAll()
         greenIbiAmpCount = 0
         greenIbiAmpLengths.removeAll()
         recentSleepWindows049.removeAll()
@@ -917,6 +949,15 @@ public final class OuraLiveSource: NSObject, ObservableObject {
                 // confirms (from the ring itself) that these server-flag features are subscription-gated OFF
                 // for an offline ring. NEVER an enable/set-mode write - purely the 0x20 read verb.
                 write([OuraCommands.spo2ReadStatus(), OuraCommands.realStepsReadStatus()])
+                // Read-only capture (#771/#772): the ring's GetProductInfo serial + hardware pages are
+                // pre-auth readable. The SERIAL is a STABLE per-ring identity — unlike the CoreBluetooth UUID,
+                // which rotates on re-pair and orphans the ring's history (#771) — and the HARDWARE id
+                // (e.g. "BLB_03") maps to the generation, confirming it from the ring instead of stray digits
+                // in the advertised name (#772). Here we only ASK and LOG the raw replies to capture their
+                // byte layout; nothing is decoded, minted into an id, or persisted yet (capture-first, so a
+                // real fixture backs the decode before it drives identity/generation). Same read-only class as
+                // the SpO2 / real-steps status reads above; never a set/enable write.
+                write([OuraCommands.getProductSerial(), OuraCommands.getProductHardware()])
             }
         default:
             break
@@ -1531,6 +1572,7 @@ extension OuraLiveSource: @preconcurrency CBCentralManagerDelegate {
         loggedAnchor = false
         loggedTierBKinds.removeAll()
         loggedFeatureStatuses.removeAll()
+        loggedProductInfo.removeAll()
         greenIbiAmpCount = 0
         greenIbiAmpLengths.removeAll()
         recentSleepWindows049.removeAll()
@@ -1614,6 +1656,7 @@ extension OuraLiveSource: @preconcurrency CBCentralManagerDelegate {
         loggedAnchor = false
         loggedTierBKinds.removeAll()
         loggedFeatureStatuses.removeAll()
+        loggedProductInfo.removeAll()
         greenIbiAmpCount = 0
         greenIbiAmpLengths.removeAll()
         recentSleepWindows049.removeAll()
@@ -1749,6 +1792,31 @@ extension OuraLiveSource: @preconcurrency CBPeripheralDelegate {
         if let batteryFrame = frames.first(where: { $0.op == OuraFraming.batteryResponseOp }),
            let battery = OuraDecoders.decodeBattery(batteryFrame.body) {
             ingest([.battery(battery)])
+        }
+        // #771/#772 capture: log the GetProductInfo reply (serial + hardware pages) raw, once per op per
+        // session. Peek only — like the 0x11 summary / 0x0D battery above, a product-info op is below the
+        // event-tag range (≥ 0x41) so it round-trips through the TLV decoder as a harmless unknown-tag no-op;
+        // nothing here decodes it into a stable id (#771) or a generation (#772) yet — that waits on this
+        // fixture. Rendered as hex AND ASCII, since the serial / hardware id are strings (e.g. "BLB_03").
+        for frame in frames where Self.productInfoResponseOps.contains(frame.op) {
+            let hex = frame.body.map { String(format: "%02x", $0) }.joined(separator: " ")
+            guard loggedProductInfo.insert("\(frame.op):\(hex)").inserted else { continue }
+            let ascii = String(bytes: frame.body.map { (0x20...0x7e).contains($0) ? $0 : 0x2e }, encoding: .ascii) ?? ""
+            log("Oura: product-info reply op=0x\(String(format: "%02x", frame.op)) (\(frame.body.count)B) raw: \(hex) | ascii: \(ascii)")
+            // The two GetProductInfo pages both arrive under op 0x19; tell them apart by content:
+            //  • hardware page ("BLB_03") → resolves a generation → correct the model (#772).
+            //  • serial page ("2H3B2405003655", no "_NN" gen marker) → the ring's STABLE identity → surface it
+            //    so the app can re-point this device onto its `oura-<serial>` id (#771).
+            if let str = OuraDecoders.productInfoString(frame.body) {
+                if let gen = OuraRingGen.from(hardwareId: str) {
+                    if gen != ringGen {
+                        log("Oura: generation from hardware id \(str) is \(gen.displayName) (was \(ringGen.displayName)) - correcting model")
+                        onModel(gen.displayName)
+                    }
+                } else if Self.isPlausibleSerial(str) {
+                    onSerial(str)
+                }
+            }
         }
         if frames.contains(where: { $0.op == OuraFraming.secureSessionOp }) {
             for frame in frames where frame.op == OuraFraming.secureSessionOp {
