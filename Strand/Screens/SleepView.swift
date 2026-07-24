@@ -1442,6 +1442,20 @@ struct SleepView: View {
 
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Night detail", overline: "Metrics", trailing: String(localized: "vs typical"))
+
+            #if os(iOS)
+            // On iOS, Sleep Debt is the actionable summary for the section, so it leads at the
+            // full two-column width. The remaining six peer metrics keep the established 2 × 3 grid.
+            StatTile(
+                label: "Sleep Debt",
+                value: debt.latest.map { durationText($0) } ?? "—",
+                caption: debtCaption(debt.latest),
+                accent: debtColor(debt.latest),
+                sparkline: spark(debt.series),
+                sparkColor: StrandPalette.metricRose)
+                .frame(maxWidth: .infinity)
+            #endif
+
             LazyVGrid(columns: tileColumns, alignment: .leading, spacing: NoopMetrics.gap) {
 
                 StatTile(
@@ -1492,6 +1506,9 @@ struct SleepView: View {
                     sparkline: spark(resp.series),
                     sparkColor: StrandPalette.metricPurple)
 
+                #if !os(iOS)
+                // macOS keeps the original adaptive dashboard instead of stretching one
+                // phone-width summary tile across an unbounded desktop detail pane.
                 StatTile(
                     label: "Sleep Debt",
                     value: debt.latest.map { durationText($0) } ?? "—",
@@ -1499,6 +1516,7 @@ struct SleepView: View {
                     accent: debtColor(debt.latest),
                     sparkline: spark(debt.series),
                     sparkColor: StrandPalette.metricRose)
+                #endif
             }
         }
     }
