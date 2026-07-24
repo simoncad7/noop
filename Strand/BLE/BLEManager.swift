@@ -555,6 +555,14 @@ public final class BLEManager: NSObject, ObservableObject {
     /// actually advertises. (PR#195)
     private var scanFallbackWorkItem: DispatchWorkItem?
     static let scanFallbackDelaySeconds: TimeInterval = 8
+    /// #730 diagnostic. A direct `central.connect(p)` to a RESTORED peripheral never scans, so
+    /// `scanFallbackWorkItem` (which only fires while `central.isScanning`) does not cover it — and
+    /// CoreBluetooth's connect has NO timeout, it pends indefinitely. A reporter's log showed exactly
+    /// that: "reconnecting", then nothing, with `didFailToConnect` (which DOES log) never firing, so
+    /// there was no way to tell pending from failed. Log once if the connect is still outstanding.
+    /// DIAGNOSTIC ONLY — it never cancels or retries; recovery is separate work.
+    private var pendingConnectProbe: DispatchWorkItem?
+    static let pendingConnectProbeSeconds: TimeInterval = 15
     /// Last time ANY notification arrived — drives the liveness watchdog.
     private var lastDataAt = Date()
     /// True while a Live/Health screen is on-screen and wants the realtime stream. One of the two
@@ -732,6 +740,11 @@ public final class BLEManager: NSObject, ObservableObject {
     private var commandChannelReady: Bool {
         state.connected && peripheral?.state == .connected && cmdCharacteristic != nil
     }
+    /// #730: a DISABLE_ALARM that `send` dropped because the link wasn't up. The connect-settle hook
+    /// re-issues ONLY this case, so a user who turned the alarm off while disconnected still gets the
+    /// strap disarmed — without making every connect emit a DISABLE_ALARM for the majority who never
+    /// armed one. Cleared once a disarm actually reaches the strap.
+    private(set) var disarmPending = false
     private var cmdNotifyCharacteristic: CBCharacteristic?
     private var eventNotifyCharacteristic: CBCharacteristic?
     private var dataNotifyCharacteristic: CBCharacteristic?
@@ -2788,6 +2801,41 @@ public final class BLEManager: NSObject, ObservableObject {
         )
     }
 
+    /// Human-readable `CBPeripheralState`, so a strap log says what the peripheral actually was at
+    /// connect time rather than a bare enum ordinal (#730).
+    private func peripheralStateName(_ s: CBPeripheralState) -> String {
+        switch s {
+        case .disconnected: return "disconnected"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .disconnecting: return "disconnecting"
+        @unknown default: return "unknown"
+        }
+    }
+
+    /// Issue a direct connect to a restored peripheral, logging that it actually happened and arming the
+    /// #730 pending-connect probe. Both restore entry points funnel through here so the two paths can be
+    /// told apart in a strap log.
+    private func connectRestored(_ p: CBPeripheral, reason: String) {
+        log("Connecting to restored peripheral (\(reason)) — peripheral state=\(peripheralStateName(p.state))")
+        central.connect(p, options: nil)
+        pendingConnectProbe?.cancel()
+        let probe = DispatchWorkItem { [weak self] in
+            guard let self, !self.state.connected, self.peripheral?.state != .connected else { return }
+            self.log("Still not connected \(Int(BLEManager.pendingConnectProbeSeconds))s after the restored "
+                     + "connect (\(reason)) — CoreBluetooth connect has no timeout, so it is still PENDING "
+                     + "(no didFailToConnect). The strap is likely out of range, asleep, or bonded elsewhere.")
+        }
+        pendingConnectProbe = probe
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + BLEManager.pendingConnectProbeSeconds, execute: probe)
+    }
+
+    private func cancelPendingConnectProbe() {
+        pendingConnectProbe?.cancel()
+        pendingConnectProbe = nil
+    }
+
     private func cancelScanFallback() {
         scanFallbackWorkItem?.cancel()
         scanFallbackWorkItem = nil
@@ -2970,14 +3018,26 @@ public final class BLEManager: NSObject, ObservableObject {
         // #34: clear the "strap keeps rejecting the alarm" streak/warning — it's about an ACTIVE arm being
         // refused, and there's nothing armed to refuse once disarmed.
         UserDefaults.standard.set(0, forKey: "alarm.rejectStreak")
+        // #730: report the OUTCOME, not the intent — using the SAME `commandChannelReady` gate the arm
+        // path already uses (it reports "queued" rather than a false "armed"). The disarm never adopted
+        // it: `send` drops the write when the link isn't up and logs "ignored — not connected", then this
+        // logged "Alarm: disarmed" anyway, telling the user the firmware alarm was cleared when the
+        // command never reached the strap — so a strap that IS armed would still buzz. (`applySmartAlarm`
+        // now re-runs on connectSettled, so a deferred disarm is re-issued once the link is really up.)
+        let willReach = commandChannelReady
+        // Latch a dropped disarm so the connect-settle hook can re-issue exactly this case, WITHOUT
+        // making every connect send a DISABLE_ALARM for the many users who never armed one.
+        disarmPending = !willReach
         if selectedModel.deviceFamily == .whoop5 {
             // 5/MG DISABLE_ALARM is REVISION_2 [0x02, 0xFF]; the rev-1 [0x01] form below is WHOOP4.
             send(.disableAlarm, payload: AlarmPayload.disableRev2())
-            log("Alarm: disarmed (5/MG rev2)")
+            log(willReach ? "Alarm: disarmed (5/MG rev2)"
+                          : "Alarm: disarm NOT sent — not connected; will retry on connect (strap may still be armed)")
             return
         }
         send(.disableAlarm, payload: [0x01])
-        log("Alarm: disarmed")
+        log(willReach ? "Alarm: disarmed"
+                      : "Alarm: disarm NOT sent — not connected; will retry on connect (strap may still be armed)")
     }
 
     /// Request the currently-armed alarm time from the strap (response arrives on cmd-notify char).
@@ -3248,7 +3308,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         if let p = restoredPeripheral {
             log("poweredOn with restored peripheral — reconnecting \(p.identifier)")
             if p.state != .connected {
-                central.connect(p, options: nil)
+                connectRestored(p, reason: "poweredOn")
             } else {
                 discoverPrimaryServices(on: p)
             }
@@ -3322,6 +3382,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         cancelScanFallback()
+        cancelPendingConnectProbe()   // #730: the connect resolved; no pending-connect log needed
         failedConnectAttempts = 0   // a successful connect clears the reconnect backoff (#414)
         restoredPeripheral = nil
         preparePeripheral(peripheral)
@@ -3554,6 +3615,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager,
                                didFailToConnect peripheral: CBPeripheral,
                                error: Error?) {
+        cancelPendingConnectProbe()   // #730: it FAILED rather than pending — this log is the answer
         log("Failed to connect\(error.map { " — \($0.localizedDescription)" } ?? "")")
         // The strap wiped its bond (a firmware update, or the official WHOOP app re-bonding it). macOS keeps
         // re-presenting the now-stale pairing key, so every reconnect loops on this same error with no
@@ -3653,7 +3715,11 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         } else {
             state.connected = false
             log("Restored DISCONNECTED peripheral \(p.identifier) — reconnect on poweredOn")
-            if central.state == .poweredOn { central.connect(p, options: nil) }
+            if central.state == .poweredOn {
+                connectRestored(p, reason: "willRestoreState")
+            } else {
+                log("Restore: central not poweredOn yet (state=\(central.state.rawValue)) — deferring to poweredOn")
+            }
         }
     }
 }
