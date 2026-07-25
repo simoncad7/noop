@@ -160,6 +160,7 @@ class DeviceRegistry(
             dao.deleteAppleDailyFor(id)
             dao.deleteMetricSeriesFor(id)
             dao.deleteDayOwnershipFor(id)
+            dao.deleteScoreInputProvenanceFor(id)
             dao.deleteSleepStatesFor(id)
             dao.deleteLabMarkersFor(id)
             dao.deleteLiveSessionsFor(id)
