@@ -1252,7 +1252,14 @@ fun TodayScreen(
             // Today" tap there flips calibratingDismissed back via the shared restore path above.
             if (selectedDayOffset == 0 && scoreState is ScoreState.Calibrating && !calibratingDismissed) {
                 Box(modifier = Modifier.fillMaxWidth()) {
-                    ScoreStateNote(scoreState)
+                    ScoreStateNote(
+                        scoreState,
+                        restartCause = ScoreState.calibrationRestartCause(
+                            ScoreState.recalibrationDay(
+                                NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L),
+                            ),
+                        ),
+                    )
                     if (updateStore != null) {
                         TodayCardDismissButton(
                             modifier = Modifier.align(Alignment.TopEnd),
@@ -4132,7 +4139,7 @@ private fun ContributorBar(label: String, readout: String, fraction: Double?, co
  *  tiles carry the real number). The whole card is the spec's "never a bare blank". Mirrors the iOS
  *  ScoreStateNote. */
 @Composable
-private fun ScoreStateNote(state: ScoreState) {
+private fun ScoreStateNote(state: ScoreState, restartCause: String? = null) {
     if (state is ScoreState.Scored) return
     val icon = when (state) {
         is ScoreState.Calibrating -> Icons.Filled.Tune
@@ -4163,6 +4170,12 @@ private fun ScoreStateNote(state: ScoreState) {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(state.title, style = NoopType.headline, color = Palette.textPrimary)
                 Text(state.detail, style = NoopType.subhead, color = Palette.textSecondary)
+                // #731: when the countdown restarted because the user tapped "Recalibrate
+                // baseline", say so - otherwise the natural response to a fresh countdown is to
+                // tap it again, resetting it once more. null (no line) if never recalibrated.
+                restartCause?.let {
+                    Text(it, style = NoopType.footnote, color = Palette.textTertiary)
+                }
             }
         }
     }
