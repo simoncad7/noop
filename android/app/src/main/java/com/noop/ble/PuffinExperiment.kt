@@ -109,17 +109,15 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
      * model-agnostic (the last self-gates on observed sample density, never on family, per #345).
      */
     fun resetFiveMGGatedProbes() {
-        prefs.edit()
-            .putBoolean(KEY, false)
-            .putBoolean(KEY_CAPTURE, false)
-            .putBoolean(KEY_DEEP_DATA, false)
-            .putBoolean(KEY_BROADCAST_HR, false)
-            .apply()
+        val editor = prefs.edit()
+        FIVE_MG_GATED_KEYS.forEach { editor.putBoolean(it, false) }
+        editor.apply()
     }
 
     companion object {
         /** Persisted preferences file. */
-        private const val PREFS = "noop_experiments"
+        /** Persisted preferences file. Internal so a UI screen can observe external writes to it. */
+        internal const val PREFS = "noop_experiments"
 
         /** Shared key name with the macOS build (`PuffinExperiment.defaultsKey`). */
         const val KEY = "noopPuffinExperiments"
@@ -132,6 +130,10 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
 
         /** "Broadcast heart rate" opt-in (mirrors macOS `PuffinExperiment.broadcastHrKey`). */
         const val KEY_BROADCAST_HR = "noopBroadcastHr"
+
+        /** The 5/MG-only probe keys, in ONE place: [resetFiveMGGatedProbes] clears exactly these, and
+         *  SettingsScreen watches exactly these for external writes. Two lists would drift. */
+        internal val FIVE_MG_GATED_KEYS = listOf(KEY, KEY_CAPTURE, KEY_DEEP_DATA, KEY_BROADCAST_HR)
 
         /** "Experimental sleep staging (V2)" opt-in (mirrors macOS `PuffinExperiment.experimentalSleepV2Key`). */
         const val KEY_EXPERIMENTAL_SLEEP_V2 = "noopExperimentalSleepV2"
