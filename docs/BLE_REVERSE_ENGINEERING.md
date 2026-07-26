@@ -442,7 +442,7 @@ garbage (HR `0`, gravity overflow). The fields below were read off real frames a
 | 77 | `status_word_1` (u16 LE) | raw; a near-static sibling of `status_word@75` (low nibble = channel index `1`). |
 | 79 | `status_word_2` (u16 LE) | raw; sibling of `@75`/`@77` (low nibble = `2`). |
 | 81 | `sleep_state` = `(byte >> 4) & 3` (+ low-nibble sub-flags) | bits 4-5 = the band sleep state: `0` wake / `1` still / `2` asleep / `3` up (deep/REM/light are off-band). Low-nibble sub-flags, observation-framed: **b0-1 `onwrist`** (on-wrist/validity flag) and **b2-3 `wake_quality`** (a 2-bit code observed nonzero **only in wake**); **b6-7 reserved** (`0` across all records). (Hypothesised from captures + a scored night on #132.) |
-| 82 | `aux_byte_82` (u8) | raw; observed **nonzero only while `sleep_state` = asleep** (meaning not pinned from observation). A third-party project reads this byte as a **sleep-only SpO₂ %** — plausible and unconfirmed, see the note below. |
+| 82 | `aux_byte_82` (u8) | the raw carry of the byte decoded as **`spo2_candidate_82`** — a strap-computed SpO₂ % scalar, tri-mode, sleep-only (#103). Instrumentation only, never a shipped metric; see the note below and [`WHOOP5_DEEP_DATA.md`](WHOOP5_DEEP_DATA.md). |
 | 83–103 | reserved | observed **constant `0`** on two straps (zero-filled). |
 | 104 | (const) | observed **constant `1`** on two straps; carried raw, no metric. |
 | 113 | `unknown_f32_113` (f32 LE) | a float32 (observed range ~ −5.3…0, `0` = unset); **purpose unknown**, carried raw. |
@@ -490,39 +490,35 @@ the float's exponent/mantissa bits proves nothing. The evidence is the gravity a
 off-wrist value. `dynamic_acceleration` is now pinned in `decoder_oracle.json` on both platforms, so a
 future offset change here fails a test rather than silently reintroducing a fabricated vital sign.
 
-#### Byte 82 may be a sleep-only SpO₂ % — open, and one capture settles it (#715)
+#### Byte 82: already decoded as `spo2_candidate_82`, blocked on a cross-device contradiction (#103)
 
-`whoop-local` ([a9eelsh](https://github.com/a9eelsh/whoop-local)) reads this byte as **WHOOP's own
-computed SpO₂ percentage, emitted only during sleep**, attributing it to hardware reverse-engineering
-(`whoop-rs`) rather than to app decompilation. That fits an observation already in the table above,
-made independently here and never explained: `aux_byte_82` is **nonzero only while `sleep_state` =
-asleep**. WHOOP measures SpO₂ only during sleep, so "sleep-only" is the signature either reading
-predicts.
+**This byte is not unmapped, and the open question is not what it is.** `Interpreter.swift` and
+`HistoricalStreams.kt` both decode `@82` as **`spo2_candidate_82`** — a strap-computed SpO₂ % scalar,
+tri-mode (70–100 a real %, bit-7 a saturation sentinel, other sub-70 a diagnostic code), populated only
+during sleep. It is instrumentation only: a guard test
+(`testHistoricalV18OpticalFieldsAreNotNamedPhysiologically`) stops it ever writing `spo2Pct`,
+`spo2_red` or `spo2_ir`, and nothing downstream reads it. The full analysis lives in
+[`WHOOP5_DEEP_DATA.md`](WHOOP5_DEEP_DATA.md); the `aux_byte_82` row above is the same byte carried raw
+alongside it.
 
-**It cannot be confirmed from anything in this repo, and the evidence base is thinner than a file count
-suggests.** There are exactly **six distinct** v18 frames in the tree — the six in `decoder_oracle.json`,
-from two straps. They recur across the Swift and Kotlin suites (2–7 files each, since the twins share
-fixtures), so a naive grep counts 21 hits and overstates the sample by 3.5×. All six are
-`sleep_state = 0` (awake) and all six carry byte 82 = 0. That is consistent with a sleep-only channel,
-and equally consistent with several other readings; absence while awake distinguishes nothing.
+**The evidence is split, and that is the whole blocker.** An 8-night independent validation with real
+spread reaches **corr +0.99** (~0.4 %/night), tracks both a 92 % desaturation and a 98 % high, and is
+offset-specific — only `@82` tracks in a 74–92 scan. But on the original #103 capture device, two
+checked nights moved **opposite** to the app value (app 95.50→92.83 vs gated mean 93.62→93.80).
+Unresolved: device/firmware variance, or an extraction error on one side. Until that contradiction
+resolves, `@82` stays a candidate.
 
-What settles it is the **value range** in a single asleep record: 90–100 is a percentage and the
-identification holds; 0–3 is a state code and it does not. Until an asleep v18 capture exists the byte
-stays raw and unnamed, per the project rule — a plausible identity is not a decoded field. If it does
-hold, it gives WHOOP 5 an SpO₂ channel this decoder currently has no source for at all.
+**What clears the bar is multi-device correlation, not one more capture** — the nightly candidate
+tracking the app's own SpO₂ across many nights on several straps, *including* the device where the two
+nights currently disagree. `tools/linux-capture/validate_spo2_candidate.py` is the harness for exactly
+that. A single asleep frame proves nothing here; the value range has been seen.
 
-One detail strengthens the reading: their decoder **gates the byte to `70…100` and drops anything
-outside**, rather than storing it unconditionally. Code written that way implies its author observed
-values inside that band *and* observed values outside it worth rejecting — which is what a real
-percentage with absent/invalid samples looks like, and not what a 0–3 state code looks like. Suggestive,
-not decisive; a gate can also be defensive.
-
-**The data to settle it very likely already exists.** The original "nonzero only while asleep"
-observation could not have come from the six fixtures — they are all awake. It came from the same
-out-of-tree **~258k-record** corpus this document cites for `hr_fixed_8_8@36` and for `status_word@75`
-"occurring as often awake as asleep", which therefore *contains asleep records*. Whoever holds that
-corpus can answer this in one query — the distribution of byte 82 where `sleep_state != 0` — without
-waiting on a new capture. That is the cheapest route to closing this out.
+**Independent corroboration (#715).** `whoop-local` reads the same byte the same way — sleep-only, and
+its decoder applies the identical `70…100` in-band gate, reached separately. That is a second source on
+the *identification*. It does not touch the contradiction above, which is about whether the values
+track a given wearer's app figures, not about what the field is. Note also that this project's decode is
+already attributed as decompile-sourced (`gen5.rs spo2_pct`), reimplemented here as a protocol fact —
+so whoop-local is corroboration, not the origin.
 
 WHOOP 5 v18 carries no raw respiration channel, and the decoders already say so: `respRateRawOff = 80`
 is set on the **4.0** `HIST_V24` layout only (§ the type-47 biometric record), and `AnalyticsEngine`
