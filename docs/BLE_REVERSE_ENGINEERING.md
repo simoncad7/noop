@@ -871,6 +871,54 @@ set, keep it reversible and non-destructive.
 
 ---
 
+## Appendix: evaluated and rejected — the LINK_VALID handshake (#715)
+
+Recorded so it is not re-proposed. `whoop-local` ([a9eelsh](https://github.com/a9eelsh/whoop-local))
+implements a handshake in which the strap sends a `LINK_VALID` (command 1) and the client must answer
+with a `COMMAND_RESPONSE` (36) carrying `[originSeq, SUCCESS, "There it is."]`, stating that otherwise
+"the strap treats the link as invalid and withholds data."
+
+**As stated, that is contradicted by what NOOP does in the field.** Neither platform has ever had a
+`LINK_VALID` handler — not one reference in `Strand/BLE/` or `com.noop.ble` — and NOOP nonetheless
+completes historical offloads, live HR and sleep sync on WHOOP 5/MG for real users. If the strap
+withheld data from a client that never answers, *every* 5/MG user would get nothing; instead the
+5/MG reports we receive are about intermittent disconnects (#802) and state restoration (#613), not
+about a strap that never sends anything.
+
+The decode corpora point the same way — **~258k v18 records**, an **18,602-record** v18 span from a
+third strap's overnight stream, a **29,203-record** v20 corpus — though note those are cited here as
+corroboration, not proof: this project also has HCI-snoop tooling (`hci_extract.py`, #103), and a
+corpus extracted from a snoop of the *official* app would have been produced by a client that DID
+answer. The field-behaviour argument above does not depend on how any corpus was captured.
+
+What may still be true is narrower: their handshake sits alongside `TOGGLE_IMU_MODE` (106) and
+`TOGGLE_OPTICAL_MODE` (108), which arm the realtime R20/R21 raw streams — so if the exchange gates
+anything, it plausibly gates *those streams* rather than the offload.
+
+Our exposure to that is limited but not zero, and worth stating precisely. NOOP takes live HR from the
+standard `0x2A37` profile and disables the R10/R11 flood on connect (§4), and it never sends
+`TOGGLE_OPTICAL_MODE` (108) at all. But `captureRawAccel` **does** send `START_RAW_DATA` (81) +
+`TOGGLE_IMU_MODE` (106) — on demand, for a bounded window, never continuously. So the one place this
+could bite is an on-demand raw-accel capture on a 5/MG. Whether that path yields IMU frames today is
+the observation that would settle the narrow claim, and it is not recorded anywhere here.
+
+**Two questions are genuinely open**, and a capture answers both without implementing anything:
+
+1. Does a WHOOP 5/MG ever send us a type-35 `COMMAND` with `cmd == 1`? The schema knows both
+   (`PacketType 35 = COMMAND`, `CommandNumber 1 = LINK_VALID`) but nothing routes it, so today it would
+   arrive and be dropped silently.
+2. If it does, does ignoring it affect *link stability* — as distinct from data flow? That is a
+   different claim from the one above and is not disproved by the corpus. It would be a candidate
+   contributor to the intermittent-disconnect reports (#802, #613), though those look unlike a link the
+   strap has declared invalid.
+
+**Provenance caveat, and it is the deciding one.** The whole path is decompile-sourced
+(`com/whoop/service/rearchitect/c.java`, `zi0/*`, `bj0/x.java`, `bj0/f.java`) and its payload is a
+**literal string lifted from the app**. This project reimplements decompile-sourced *facts* with
+attribution when they are treated as unvalidated candidates — `spo2_candidate_82` is the precedent —
+but an offset is a fact and a magic string is expression. Even if question 1 turns out yes, the reply
+should be derived from our own capture of what the strap accepts, not copied.
+
 ## Appendix: observed but undecoded (#791)
 
 A reporter running an instrumented build on a **WHOOP 4.0 with recent firmware** (Galaxy S24 Ultra) dumped
