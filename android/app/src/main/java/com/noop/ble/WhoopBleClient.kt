@@ -4475,10 +4475,20 @@ class WhoopBleClient(
                         // dataRangeNewestUnix straight from a normal strap-log export. Mirrors the Swift line.
                         val hex = frame.joinToString("") { "%02x".format(it) }
                         log("Get Data Range raw frame (#451 — for offset analysis): $hex")
-                        // #689: ring-buffer page backlog, DIAGNOSTIC ONLY (RE'd, unconfirmed — never gates
-                        // sync/backfill). Logged only when it decodes plausibly; a short/garbage frame → null.
-                        com.noop.protocol.DataRange.pagesBehind(frame, cmdOff)?.let {
-                            log("Strap backlog pages behind: $it (#689 — GET_DATA_RANGE ring backlog, diagnostic only)")
+                        // #689: ring-buffer page backlog, DIAGNOSTIC ONLY — never gates sync/backfill.
+                        // BOTH branches log, deliberately. Until #818 the offsets were two bytes early, so
+                        // ring capacity always read 0, the `t > 0` guard rejected every real frame, and this
+                        // logged NOTHING — a strap log was indistinguishable from one where the strap never
+                        // answered, which is why a broken decode survived unnoticed. The raw-frame dump above
+                        // is unconditional for the same reason. Twin of the Swift branch.
+                        val pagesBehind = com.noop.protocol.DataRange.pagesBehind(frame, cmdOff)
+                        if (pagesBehind != null) {
+                            log("Strap backlog pages behind: $pagesBehind (#689 — GET_DATA_RANGE ring backlog, diagnostic only)")
+                        } else {
+                            log(
+                                "Strap backlog pages behind: not decodable from this frame (#689 — offsets may " +
+                                    "have moved; the raw frame above is the input). Diagnostic only, sync is unaffected.",
+                            )
                         }
                         dataRangeNewestUnix(frame)?.let {
                             strapNewestTs = it
