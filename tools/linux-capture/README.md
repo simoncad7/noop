@@ -585,11 +585,30 @@ strap-computed SpO₂ scalar (the `spo2_candidate_82` decode already in Swift/Ko
 **nightly means** against your WHOOP CSV export — the multi-device bar described in
 [`docs/WHOOP5_DEEP_DATA.md`](../../docs/WHOOP5_DEEP_DATA.md).
 
+The frame source can be **either** an `hci_extract` / `whoop_capture` `capture.json` **or the SQLite
+capture DB `whoop_sync.py` writes** (`captures/whoop.db`) — the same `frames` table
+`whoop_activity.py` reads. Previously a Linux capture had to be round-tripped through
+`whoop_sync.py export --only-type 47` before this tool, which sits in the same directory, could read
+it. The file is identified by its SQLite header rather than its extension, since capture DBs get
+renamed freely. Use `--device-id` if yours is not the default `2`.
+
+Only v18 rows are read, filtered in SQL rather than after loading: newer 5/MG firmware serves a
+v20 (2140 B) + v21 (1244 B) pair every second alongside the 124-byte v18, and only v18 carries
+`@82`. On a mixed corpus that is the difference between 115 MB and 28 MB to reach the same 20k
+usable records.
+
+> **This is the capture tooling's database, not the app's.** Neither shipped app has a `frames`
+> table — Android uses Room, iOS/macOS uses GRDB — so this cannot be pointed at a phone's store or a
+> `.noopbak`. Validating a strap still requires a capture.
+
 ```bash
-# One strap (summary stays aggregate-only unless you pass --show-nights):
+# One strap from a capture (summary stays aggregate-only unless you pass --show-nights):
 python3 validate_spo2_candidate.py capture.json my_whoop_data/ --device strap-a --postable
 
-# Several straps at once:
+# ...or straight from a whoop_sync.py capture DB, skipping the export step:
+python3 validate_spo2_candidate.py captures/whoop.db my_whoop_data/ --device strap-a --postable
+
+# Several straps at once (entries may mix .json and .db, and carry their own device_id):
 python3 validate_spo2_candidate.py --batch devices.json --postable
 ```
 
