@@ -1,8 +1,8 @@
 """Tests for whoop_spot_hrv.py — the spot-HRV DSP, on synthetic signals with KNOWN beats.
 
 These test the algorithm (peak detection, RR, RMSSD, glitch rejection) against signals whose ground truth
-we control — not strap frames. Stdlib only; run with `pytest test_whoop_spot_hrv.py` or
-`python3 -m pytest test_whoop_spot_hrv.py`.
+we control — not strap frames. Stdlib only; runs under either `python3 -m unittest` (the runner the
+README documents and the only one in requirements.txt) or pytest.
 """
 import math
 
@@ -88,3 +88,16 @@ def test_spot_hrv_returns_none_on_flat_signal():
     t = [i / fs for i in range(120)]
     v = [50000.0] * 120
     assert H.spot_hrv(t, v, fs) is None
+
+
+# ── unittest collection ───────────────────────────────────────────────────────────────────────────
+# Same hook, and the same reason, as test_whoop_activity.py: this module is pytest-style (bare
+# `def test_*`, no unittest.TestCase), so `python3 -m unittest` collected NOTHING from it and exited 0
+# — which is indistinguishable from passing. All eight take no fixtures, so wrapping them is enough.
+def load_tests(loader, tests, pattern):    # noqa: ARG001 — unittest protocol signature
+    import unittest
+    suite = unittest.TestSuite(tests)
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            suite.addTest(unittest.FunctionTestCase(fn, description=name))
+    return suite
