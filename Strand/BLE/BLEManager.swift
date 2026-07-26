@@ -3378,9 +3378,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             return
         }
         cancelScanFallback()
-        // Persist the family that actually advertised so the next scan starts on the right service —
-        // this is what makes a one-time rotation stick after a stale-preference reconnect. (PR#195)
-        UserDefaults.standard.set(selectedModel.rawValue, forKey: "selectedWhoopModel")
+        persistSelectedModel(selectedModel)
         log("Discovered \(name) (rssi \(RSSI)) — connecting")
         central.stopScan()
         preparePeripheral(peripheral)
@@ -3733,6 +3731,23 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
 
 // MARK: - CBPeripheralDelegate
 extension BLEManager: @preconcurrency CBPeripheralDelegate {
+    /// Persist the WHOOP family we are actually talking to, so the next launch scans the right service —
+    /// what makes a one-time fallback rotation stick (PR#195) — and, on a genuine family switch, untick the
+    /// 5/MG-only probes so none carries over to a strap that cannot support it.
+    ///
+    /// Compares `deviceFamily`, not the raw value: if MG ever splits from plain 5.0 into its own case the
+    /// two would share `.whoop5`, and a raw-value compare would then reset on a same-family switch. Mirrors
+    /// the Kotlin `persistSelectedModel` service compare.
+    private func persistSelectedModel(_ model: WhoopModel) {
+        let previous = UserDefaults.standard.string(forKey: "selectedWhoopModel")
+        UserDefaults.standard.set(model.rawValue, forKey: "selectedWhoopModel")
+        guard let previous,
+              let previousModel = WhoopModel(rawValue: previous),
+              previousModel.deviceFamily != model.deviceFamily else { return }
+        PuffinExperiment.resetFiveMGGatedProbes()
+        log("Strap family switched (\(previous) → \(model.rawValue)) — reset 5/MG-only experimental toggles to off.")
+    }
+
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error {
             log("Service discovery failed: \(error.localizedDescription)")
@@ -3740,6 +3755,17 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         }
         guard let services = peripheral.services else { return }
         log("Services discovered: \(services.map { $0.uuid.uuidString }.joined(separator: ", "))")
+        // Record the family from the services the strap ACTUALLY exposes, not just from a scan. The adopt
+        // paths in connectCore (`retrieveConnectedPeripherals` / `retrievePeripherals`) reach didConnect
+        // WITHOUT ever passing through didDiscover, so a strap attached that way never persisted its family
+        // and the next launch scanned the wrong service until the fallback rotation recovered. This is the
+        // Apple analogue of the Android fix in WhoopBleClient's connect-time family resolution. Checked
+        // once here rather than inside the loop so a strap exposing both services can't thrash the pref.
+        if services.contains(where: { $0.uuid == BLEManager.whoop5Service }) {
+            persistSelectedModel(.whoop5mg)
+        } else if services.contains(where: { $0.uuid == BLEManager.customService }) {
+            persistSelectedModel(.whoop4)
+        }
         for s in services {
             switch s.uuid {
             case BLEManager.customService:
