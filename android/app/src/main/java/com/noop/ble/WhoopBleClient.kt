@@ -32,6 +32,7 @@ import com.noop.data.StreamPersistence
 import com.noop.protocol.Whoop5RawImu
 import com.noop.data.WhoopRepository
 import com.noop.protocol.AlarmPayload
+import com.noop.protocol.DYN_ACCEL_STILL_THRESHOLD_G
 import com.noop.protocol.BackfillCaptureJsonl
 import com.noop.protocol.BackfillCaptureRecord
 import com.noop.protocol.BackfillCaptureSummary
@@ -6029,6 +6030,11 @@ class WhoopBleClient(
             // itself - not gated on the Connection test mode. Twin of the macOS LiveState sink hook.
             testCentre.noteDrainedRows(backfiller.sessionRowsPersisted)
         }
+
+        // #520: the motion-magnitude diagnostic for this session. Emitted independently of the summary
+        // above (a caught-up session banks no rows but can still have decoded records), and silent when
+        // nothing carried the field — a WHOOP 4.0 never does. Twin of the macOS exitBackfilling hook.
+        backfiller.sessionDynAccel.logLine(DYN_ACCEL_STILL_THRESHOLD_G)?.let { log(it) }
 
         // Connection test mode: the offload OUTCOME the readout's lastOffloadResult id binds. Gated
         // zero-cost (the CONNECTION bool is read before any string is built). Diagnostic only - it reads

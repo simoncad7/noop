@@ -1776,6 +1776,13 @@ public final class BLEManager: NSObject, ObservableObject {
                 log(diag)
             }
         }
+        // #520: the motion-magnitude diagnostic for this session. Emitted independently of the summary
+        // above — a caught-up session banks no rows but can still have decoded records — and silent when
+        // nothing carried the field, which a WHOOP 4.0 never does.
+        if let bf = backfiller,
+           let dynLine = bf.sessionDynAccel.logLine(threshold: dynAccelStillThresholdG) {
+            log(dynLine)
+        }
         // Connection test mode: the offload OUTCOME the readout's lastOffloadResult id binds. Gated
         // zero-cost (the .connection bool is read before any string is built). Diagnostic only - it reads
         // the same per-session tallies the existing summary above does, changing no offload behaviour. A
