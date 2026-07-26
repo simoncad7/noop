@@ -429,11 +429,12 @@ garbage (HR `0`, gravity overflow). The fields below were read off real frames a
 | 23 | `rr_count` (u8) | matches #valid R-R intervals 100 % (1141/1143) |
 | 24 + 2·i | `rr[i]` (u16, ms) | 60000/mean(R-R) ≈ HR for 88 % (rest are HR-averaging) |
 | 36 | `hr_fixed_8_8` (u16 LE) — bpm = `value/256` | a **higher-precision heart rate**: `value/256` correlates **0.989** with the integer `heart_rate@22` over ~258k records and carries sub-bpm fractions `@22` can't (e.g. `25997` → 101.55 bpm vs `@22`=102). |
-| 33 / 38 / 40 | raw bytes near the HR / R-R fields | carried **raw** (meaning not pinned from observation): `@33` a flag-ish byte, `@38` a u16 beside the R-R fields, `@40` a status-like byte. |
+| 33 / 38 / 40 | raw bytes near the HR / R-R fields | carried **raw** (meaning not pinned from observation): `@33` a flag-ish byte, `@38` a u16 beside the R-R fields, `@40` a status-like byte. `whoop-local` names `@40` **`signal_quality`** (#715) — plausible for a byte sitting beside HR, but it appears only in that project's code with no stated source and no supporting analysis, so it stays raw here. |
+| 41 | `dynamic_acceleration` (f32, g) | the strap's own **gravity-removed motion magnitude**, one scalar per second sitting immediately before the gravity triplet. Gated to `[0, 8] g` so a wrong offset stores nothing rather than garbage; reads 0.006–0.033 g across the resting oracle frames. Decoded on both platforms but **not persisted and not scored** — `step_motion_counter@57` and `activity_class@63` are what the motion paths actually consume. See the byte-43 note below. |
 | 45 / 49 / 53 | `gravity_x/y/z` (f32, g) | \|g\| ≈ 1.0 for 100 % of 500 records; v18 has **one** triplet (not v24's two) |
 | 57–58 | `step_motion_counter` (u16 LE @[57:59]) | a **cumulative** counter: climbs while moving, flat when still, low byte wraps at 256. **Steps = Σ wrap-aware diffs** `(cur-prev)&0xFFFF` — *not* the value summed per record (that over-counts massively — the WHOOP 5/MG step over-report). No per-record step count is in the record. |
 | 59 | `step_cadence` (u8) | a **cadence-like** byte between the counter and `@63`: never `0`, and lower when moving faster (still > walk > run in the data). Raw — no unit asserted. |
-| 63 | `motion_wear_quality` (u8) {0,1,2} | a 3-valued byte; kept **raw** (semantics not pinned from observation). |
+| 63 | `motion_wear_quality` (u8) {0,1,2} | a 3-valued byte; kept **raw** (semantics not pinned from observation). Also read as an **activity class** (0 still / 1 walk / 2 run, #316); `whoop-local` decodes the same offset with the same `<= 2` gate, reached independently (#715). |
 | 69 | `temp_aux_1_raw` (i16 LE); °C = value/10 | a **secondary temperature channel**: tracks `skin_temp@73` (corr **0.92** on two straps) with the same on-wrist diurnal curve; deci-°C resolution. |
 | 71 | `temp_aux_2_raw` (i16 LE); °C = value/10 | a second **temperature channel**: tracks `skin_temp@73` (corr **0.97**), same diurnal behaviour. |
 | 73 | `skin_temp_raw` (u16); °C = raw / 100 | A **digital skin-temperature sensor**, identified **purely from the data**: the on-wrist warming/diurnal curve is a thermal signature nothing else in the record has. **Scale = `/100`** — the only divisor that yields a physiological worn skin temperature (median ≈ **34 °C** across two straps; `/128` reads a non-physiological ≈ 27 °C). Decoded in `decodeWhoop5Historical` (`Interpreter.swift`); flows to the decode-features store as `skin_temp_raw` + derived `skin_temp_c`. |
@@ -441,7 +442,7 @@ garbage (HR `0`, gravity overflow). The fields below were read off real frames a
 | 77 | `status_word_1` (u16 LE) | raw; a near-static sibling of `status_word@75` (low nibble = channel index `1`). |
 | 79 | `status_word_2` (u16 LE) | raw; sibling of `@75`/`@77` (low nibble = `2`). |
 | 81 | `sleep_state` = `(byte >> 4) & 3` (+ low-nibble sub-flags) | bits 4-5 = the band sleep state: `0` wake / `1` still / `2` asleep / `3` up (deep/REM/light are off-band). Low-nibble sub-flags, observation-framed: **b0-1 `onwrist`** (on-wrist/validity flag) and **b2-3 `wake_quality`** (a 2-bit code observed nonzero **only in wake**); **b6-7 reserved** (`0` across all records). (Hypothesised from captures + a scored night on #132.) |
-| 82 | `aux_byte_82` (u8) | raw; observed **nonzero only while `sleep_state` = asleep** (meaning not pinned from observation). |
+| 82 | `aux_byte_82` (u8) | raw; observed **nonzero only while `sleep_state` = asleep** (meaning not pinned from observation). A third-party project reads this byte as a **sleep-only SpO₂ %** — plausible and unconfirmed, see the note below. |
 | 83–103 | reserved | observed **constant `0`** on two straps (zero-filled). |
 | 104 | (const) | observed **constant `1`** on two straps; carried raw, no metric. |
 | 113 | `unknown_f32_113` (f32 LE) | a float32 (observed range ~ −5.3…0, `0` = unset); **purpose unknown**, carried raw. |
@@ -455,6 +456,78 @@ WHOOP 5 worn over the same window, both offloaded and decoded, agree at **corr 0
 overlapping 1 Hz samples, with a **rest-only mean absolute error of 0.7 bpm** (they diverge only during
 exercise, as two independent PPG sensors do). That is a large-sample, cross-generation check on HR@22
 on top of the live-vs-historical match above.
+
+#### Byte 43 is not a respiration rate (#520)
+
+A third-party decoder reads a `u8` at payload offset 35 — **frame offset 43** — and labels it a raw
+respiration rate. It is not. Frame 43 is the third byte of the little-endian `dynamic_acceleration`
+float32 at 41, and the claim is disproved by the fixture frames already in the repo:
+
+| frame | byte 43 as "brpm" | f32@41 as g | \|g\| @45/49/53 |
+|---|---|---|---|
+| `whoop5_v18_real_worn` | 22 | 0.0092 | 1.0086 |
+| `whoop5_v18_real_one_rr` | 47 | 0.0107 | 1.0106 |
+| **`whoop5_v18_real_offwrist`** | **195** | 0.0060 | 0.9985 |
+| `whoop5_v18_real_ack_capture` | 108 | 0.0144 | 1.0074 |
+| `whoop5_v18_real_device2_hr57` | 6 | 0.0328 | 1.0029 |
+| `whoop5_v18_real_device2_hr63` | 9 | 0.0084 | 1.0096 |
+
+Two readings of bytes 41–44 are on offer, and they disagree about byte 43. The evidence, in order:
+
+1. **The 4-byte grid is fixed.** The f32s at 45/49/53 give \|g\| = 0.9985…1.0106 on every frame; three
+   values landing on unit magnitude together is not something a misaligned read produces.
+2. **Read as an f32 on that grid, 41–44 is physically coherent** — 0.006–0.033 g on all six frames,
+   the right size for a gravity-removed magnitude, and it stays coherent across worn, off-wrist and
+   two different straps. (Being on the grid doesn't by itself make it a float; the coherence is what
+   argues it is one.)
+3. **Read as a rate, byte 43 is impossible** — 6…195 "brpm", worst on the **off-wrist** frame: 195
+   breaths/min from a strap nobody is wearing, with `heart_rate@22` = 0.
+
+A byte belongs to one field. (2) and (3) can't both be right, and (3) is refuted by its own values.
+
+Note the tautology to avoid: byte 43 *is* byte 2 of that float by construction, so reproducing it from
+the float's exponent/mantissa bits proves nothing. The evidence is the gravity anchor plus the
+off-wrist value. `dynamic_acceleration` is now pinned in `decoder_oracle.json` on both platforms, so a
+future offset change here fails a test rather than silently reintroducing a fabricated vital sign.
+
+#### Byte 82 may be a sleep-only SpO₂ % — open, and one capture settles it (#715)
+
+`whoop-local` ([a9eelsh](https://github.com/a9eelsh/whoop-local)) reads this byte as **WHOOP's own
+computed SpO₂ percentage, emitted only during sleep**, attributing it to hardware reverse-engineering
+(`whoop-rs`) rather than to app decompilation. That fits an observation already in the table above,
+made independently here and never explained: `aux_byte_82` is **nonzero only while `sleep_state` =
+asleep**. WHOOP measures SpO₂ only during sleep, so "sleep-only" is the signature either reading
+predicts.
+
+**It cannot be confirmed from anything in this repo, and the evidence base is thinner than a file count
+suggests.** There are exactly **six distinct** v18 frames in the tree — the six in `decoder_oracle.json`,
+from two straps. They recur across the Swift and Kotlin suites (2–7 files each, since the twins share
+fixtures), so a naive grep counts 21 hits and overstates the sample by 3.5×. All six are
+`sleep_state = 0` (awake) and all six carry byte 82 = 0. That is consistent with a sleep-only channel,
+and equally consistent with several other readings; absence while awake distinguishes nothing.
+
+What settles it is the **value range** in a single asleep record: 90–100 is a percentage and the
+identification holds; 0–3 is a state code and it does not. Until an asleep v18 capture exists the byte
+stays raw and unnamed, per the project rule — a plausible identity is not a decoded field. If it does
+hold, it gives WHOOP 5 an SpO₂ channel this decoder currently has no source for at all.
+
+One detail strengthens the reading: their decoder **gates the byte to `70…100` and drops anything
+outside**, rather than storing it unconditionally. Code written that way implies its author observed
+values inside that band *and* observed values outside it worth rejecting — which is what a real
+percentage with absent/invalid samples looks like, and not what a 0–3 state code looks like. Suggestive,
+not decisive; a gate can also be defensive.
+
+**The data to settle it very likely already exists.** The original "nonzero only while asleep"
+observation could not have come from the six fixtures — they are all awake. It came from the same
+out-of-tree **~258k-record** corpus this document cites for `hr_fixed_8_8@36` and for `status_word@75`
+"occurring as often awake as asleep", which therefore *contains asleep records*. Whoever holds that
+corpus can answer this in one query — the distribution of byte 82 where `sleep_state != 0` — without
+waiting on a new capture. That is the cheapest route to closing this out.
+
+WHOOP 5 v18 carries no raw respiration channel, and the decoders already say so: `respRateRawOff = 80`
+is set on the **4.0** `HIST_V24` layout only (§ the type-47 biometric record), and `AnalyticsEngine`
+notes "WHOOP5 v18 carries no raw resp ADC, so this is an on-device estimate" where it derives the rate
+from RSA instead.
 
 Skin temperature @73 **is** decoded (above); PPG / SpO₂ still live further in the 124-byte record but
 lack on-device ground truth, so that region is left raw rather than guessed (project rule: real
@@ -544,6 +617,14 @@ The bodies are blocks of fixed-length **sample channels**:
   or moving v20 capture in the tree, and the earlier "same sensor set as v21" claim was the only basis for
   calling it optical — now that v21 is inertial, that inference no longer supports an optical reading. Do
   not treat v20 as an SpO₂/BP optical substrate pending a labelled **moving** capture.
+
+  **Independently corroborated (#715).** `whoop-local` lists six 20-bit v20 channel offsets, derived
+  separately from this tree: frame `47, 247, 1313, 1513, 1735, 1935`. Those are exactly the six slots of
+  our **non-empty** blocks (0, 3 and 4 — the corpus shows block counts are always `[25, 0, 0, 25, 25]`),
+  out of the ten listed above. Two unrelated methods agreeing on which six slots carry data, and where,
+  is the strongest confirmation this layout has. Note what it does **not** settle: both projects agree on
+  the *structure*, and neither has a labelled capture, so the sensor-identity question above is untouched
+  — agreement about where the bytes are is not evidence about what produced them.
 
 `decodeWhoop5HistoricalV2021` exposes `layout_marker`, `record_index`, `unix`, and the channels as **raw
 i16 sample arrays with no scale applied at this layer**. For **v21** the channels are named `accel_x/y/z`
