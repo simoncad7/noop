@@ -661,9 +661,144 @@ class FeatureAbsentClassificationTests(unittest.TestCase):
         self.assertIn("feature_absent=1", blob)
         self.assertIn("strap-c,feature_absent,", blob)
 
+    def test_a_cadence_coarser_than_a_window_cannot_claim_absence(self):
+        """Duration bars do not catch aliasing: missing the window is a PHASE problem.
+
+        851 records over 71 hours clears both ABSENT_MIN_RECORDS and ABSENT_MIN_ASLEEP_SPAN_S, but at
+        a 300 s cadence the capture only ever occupies 4 residues mod a 1200 s period — so it either
+        always lands in the window or never does. All-zero here is not evidence of anything.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            d = self._flat_zero_device(td, "coarse", step_s=300)
+            res = vs.validate_device(d["capture"], d["export"], device="coarse")
+        self.assertEqual(res["duty"]["mode"], "absent")
+        self.assertGreaterEqual(res["duty"]["n_records"], vs.ABSENT_MIN_RECORDS)
+        self.assertEqual(res["classification"], "fail")
+        self.assertIn("NOT claiming feature_absent", vs.format_duty_line(res))
+
+    def test_an_aliased_capture_of_a_WORKING_strap_is_not_reported_absent(self):
+        """The case the duration bars let through: @82 is duty-cycling perfectly, the capture just
+        never samples inside the window. Reporting this strap as lacking the feature would drop a real
+        device out of the multi-device gate and make promotion easier."""
+        period, phase, window = 1200, 337, 30
+        with tempfile.TemporaryDirectory() as td:
+            frames, nights = [], []
+            for i in range(4):
+                t0 = _utc(2026, 4, 1 + i, 23, 0, 0)
+                t1 = t0 + 8 * 3600
+                frames += _plant_duty_night(
+                    t0, t1, 95, period=period, phase=phase, window=window, step_s=300
+                )
+                start = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                nights.append((start, 95.0, t0, t1))
+            cap = os.path.join(td, "aliased.json")
+            with open(cap, "w") as f:
+                json.dump(frames, f)
+            res = vs.validate_device(cap, _write_export(td, nights), device="aliased")
+        self.assertEqual(res["duty"]["n_nonzero"], 0)      # the strap works; the capture missed it
+        self.assertEqual(res["duty"]["mode"], "absent")
+        self.assertNotEqual(res["classification"], "feature_absent")
+
+    def test_a_dense_burst_plus_one_far_later_record_cannot_claim_absence(self):
+        """Wall-clock span is not observation. 120 records at 1 Hz plus a single record eight hours
+        later clears the record count, spans 8 h, and has a 1 s median cadence — but the capture only
+        ever watched the strap for ~2 minutes, which is no evidence of anything."""
+        t0 = _utc(2026, 5, 1, 23, 0, 0)
+        stamps = list(range(t0, t0 + 120)) + [t0 + 8 * 3600]
+        with tempfile.TemporaryDirectory() as td:
+            frames = [
+                {"hex": make_v18(unix=u, sleep_state=2, hr=52, aux_byte_82=0).hex()} for u in stamps
+            ]
+            cap = os.path.join(td, "sparse.json")
+            with open(cap, "w") as f:
+                json.dump(frames, f)
+            exp_dir = os.path.join(td, "sparse")
+            os.makedirs(exp_dir)
+            start = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _write_export(exp_dir, [(start, 96.0, t0, t0 + 8 * 3600)])
+            res = vs.validate_device(cap, exp_dir, device="sparse")
+        self.assertEqual(res["duty"]["mode"], "absent")
+        self.assertGreaterEqual(res["duty"]["n_records"], vs.ABSENT_MIN_RECORDS)   # count bar clears
+        self.assertLessEqual(res["duty"]["record_interval_s"], vs.NOMINAL_DUTY_WINDOW_S)  # cadence too
+        self.assertEqual(res["classification"], "fail")
+
+    def _asleep_device(self, td, label, stamps):
+        frames = [
+            {"hex": make_v18(unix=u, sleep_state=st, hr=52, aux_byte_82=0).hex()} for u, st in stamps
+        ]
+        cap = os.path.join(td, f"{label}.json")
+        with open(cap, "w") as f:
+            json.dump(frames, f)
+        exp_dir = os.path.join(td, label)
+        os.makedirs(exp_dir)
+        t0 = min(u for u, _ in stamps)
+        t1 = max(u for u, _ in stamps)
+        start = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        _write_export(exp_dir, [(start, 96.0, t0, t1)])
+        return vs.validate_device(cap, exp_dir, device=label)
+
+    def test_repeated_timestamps_do_not_inflate_observed_sleep(self):
+        """A resume/reconnect in whoop_sync.py can re-deliver the same historical rows. Counting
+        records rather than distinct seconds turns 200 s of sleep repeated twenty times into 4000 s of
+        'observation' — enough to clear the bar off 200 s of real data."""
+        t0 = _utc(2026, 6, 1, 22, 0, 0)
+        dupes = [(t0 + i, 2) for i in range(200) for _ in range(20)]
+        with tempfile.TemporaryDirectory() as td:
+            res = self._asleep_device(td, "dupes", dupes)
+        self.assertEqual(res["duty"]["mode"], "absent")
+        self.assertEqual(res["observed_asleep_s"], 200)      # distinct seconds, not 4000 records
+        self.assertEqual(res["classification"], "fail")
+
+    def test_a_dense_awake_stretch_cannot_hide_an_aliasing_sleep_cadence(self):
+        """The gate has to read the ASLEEP cadence. A capture that is 1 Hz awake and 300 s asleep has
+        a 1 s whole-capture median, which would sail through the window gate while the only part that
+        matters aliases against the duty period."""
+        t0 = _utc(2026, 6, 1, 22, 0, 0)
+        awake = [(t0 + i, 0) for i in range(5000)]
+        asleep = [(t0 + 5000 + i * 300, 2) for i in range(4000)]
+        with tempfile.TemporaryDirectory() as td:
+            res = self._asleep_device(td, "mixed", awake + asleep)
+        self.assertEqual(res["duty"]["record_interval_s"], 1.0)   # whole-capture median says 1 Hz…
+        self.assertEqual(res["asleep_interval_s"], 300.0)         # …the part that matters does not
+        self.assertEqual(res["classification"], "fail")
+        self.assertIn("asleep cadence", vs.format_duty_line(res))
+
+    def test_a_cadence_at_the_window_length_can_still_claim_absence(self):
+        """Boundary: a cadence at or below the window length cannot skip a window whatever the phase,
+        so a flat-zero capture there IS evidence. Guards the gate against being over-tightened."""
+        with tempfile.TemporaryDirectory() as td:
+            d = self._flat_zero_device(td, "edge", step_s=vs.NOMINAL_DUTY_WINDOW_S)
+            res = vs.validate_device(d["capture"], d["export"], device="edge")
+        self.assertEqual(res["classification"], "feature_absent")
+
     def test_postable_still_carries_no_raw_spo2_values(self):
         """The duty/coverage columns are device timing, not health data — the privacy property of
-        --postable has to survive everything added here."""
+        --postable has to survive everything added here.
+
+        Uses a device with REAL, distinct per-night values. The flat-zero fixture this used to run on
+        has no SpO₂ readings to leak, so it passed whatever the formatter did with them.
+        """
+        spo2s = [91, 93, 95, 97, 92, 98]
+        with tempfile.TemporaryDirectory() as td:
+            frames, nights = [], []
+            base = _utc(2026, 8, 1, 0, 0, 0)
+            for i, s in enumerate(spo2s):
+                t0 = base + i * 86400 + 23 * 3600
+                t1 = t0 + 7 * 3600
+                frames += _plant_duty_night(t0, t1, s, period=900, phase=111, window=20)
+                start = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                nights.append((start, float(s), t0, t1))
+            cap = os.path.join(td, "vals.json")
+            with open(cap, "w") as f:
+                json.dump(frames, f)
+            res = vs.validate_device(cap, _write_export(td, nights), device="vals")
+        blob = vs.format_postable([res])
+        self.assertEqual(res["paired_nights"], len(spo2s))   # the values really were there to leak
+        for s in spo2s:
+            self.assertNotIn(f"{s}.00", blob)
+            self.assertNotIn(f"{float(s):.1f}", blob)
+
+    def test_postable_on_a_flat_zero_device_is_still_clean(self):
         with tempfile.TemporaryDirectory() as td:
             d = self._flat_zero_device(td, "priv")
             res = vs.validate_device(d["capture"], d["export"], device="priv")
