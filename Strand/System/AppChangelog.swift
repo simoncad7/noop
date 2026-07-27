@@ -7,7 +7,7 @@ enum AppChangelog {
 
     /// Bump this when you add a release below. The "What's New" sheet shows automatically when the
     /// stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
-    static let currentVersion = "9.0.2"
+    static let currentVersion = "9.2.0"
 
     struct Release: Identifiable {
         let version: String
@@ -19,6 +19,18 @@ enum AppChangelog {
 
     /// Newest first.
     static let releases: [Release] = [
+        Release(
+            version: "9.2.0",
+            title: "HRV accuracy fix, Oura sleep and motion, richer 5/MG decoding, and a stoppable sync",
+            date: "July 2026",
+            items: [
+                "**HRV was reading low (#823).** Same-second R-R beats were sorted by size instead of the order the strap sent them, which biased RMSSD downward. Fixed on both platforms — your HRV numbers will shift slightly, and the new ones are the correct ones.",
+                "**Oura nights now actually score (#774, #773).** Overnight beats banked by the ring are turned into heart-rate samples, so a night no longer comes back empty, and the ring's own sleep hypnogram appears as its own stage timeline.",
+                "**Workout heart rate reads from the right strap (#856).** The chart, the zones and the Avg HR now agree on which device recorded a bout, instead of quietly disagreeing after you re-add a strap.",
+                "**Battery warnings that arrive in time (#864).** A critical alert at 12%, plus a bedtime warning when the strap will not last the night — both fire even after the earlier alerts have already gone quiet.",
+                "**You can stop a sync (#875).** A long history offload no longer has to run to the end; nothing is lost, and the rest arrives on the next sync.",
+            ]
+        ),
         Release(
             version: "9.0.2",
             title: "Optimal-strain alerts, faster history sync, and a wave of accuracy fixes",
