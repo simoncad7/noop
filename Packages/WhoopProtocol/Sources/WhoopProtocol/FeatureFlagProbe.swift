@@ -126,9 +126,22 @@ public enum FeatureFlagProbe {
             self.validKey = validKey
             self.key = key
         }
-        /// The cursor is done: the firmware said the entry is invalid, returned the 0xFF end marker, or
-        /// carried no decodable name. Any of the three stops the walk.
-        public var isExhausted: Bool { !validKey || index == 0xFF || key == nil }
+        /// The STRAP said stop: it returned the 0xFF end marker, or flagged the entry as not a real key.
+        /// Both are the firmware's own signal, so both are trusted.
+        ///
+        /// Deliberately does NOT include `key == nil`. That is OUR parser declining a name — a byte outside
+        /// printable ASCII, or one longer than `maxKeyLength` — and it says nothing about whether the strap
+        /// has more entries. Treating it as a terminator meant one undecodable name threw away every entry
+        /// after it: a list of forty with a bad byte at seven yielded six keys. See `isSkippable`.
+        public var isExhausted: Bool { !validKey || index == 0xFF }
+
+        /// The firmware calls this a real key but the name did not decode. Record it and KEEP WALKING.
+        ///
+        /// Safe because the walk was never bounded by this: `maxFlags` caps the replies and the announced
+        /// count bounds it further, so skipping can only spend budget that already exists. And it matters
+        /// most on the run that matters most — the first real capture is the expensive one to obtain, so
+        /// truncating it on our own strictness is the worst possible time to lose entries.
+        public var isSkippable: Bool { validKey && index != 0xFF && key == nil }
     }
 
     // MARK: - Parsing
@@ -244,6 +257,9 @@ public struct FeatureFlagProbeReport: Equatable, Sendable {
     public private(set) var reportedCount: Int?
     /// Result code of the START reply on 5/MG (nil on 4.0, or before it lands).
     public private(set) var startResult: Int?
+    /// Entries the strap flagged as real keys whose NAME did not decode, and which the walk stepped over
+    /// rather than stopping at. Surfaced in the report so a dump with holes never reads as a complete list.
+    public private(set) var skipped = 0
     /// Set once the walk stopped for a reason we can name.
     public private(set) var stopReason: String?
 
@@ -270,10 +286,30 @@ public struct FeatureFlagProbeReport: Equatable, Sendable {
         if let c = r.resultCode { line += " result=\(FeatureFlagProbe.resultLabel(c))(\(c))" }
         trace.append(line)
         if r.isExhausted {
-            stopReason = r.index == 0xFF
-                ? "cursor exhausted (index 0xFF)"
-                : (r.validKey ? "entry carried no decodable key name" : "firmware reported validKey=false")
+            if r.index == 0xFF {
+                stopReason = "cursor exhausted (index 0xFF)"
+            } else {
+                // `validKey = 0` is documented as an end marker alongside 0xFF, and it is the firmware's
+                // own flag, so it is trusted here. But nothing observed so far rules out the other
+                // reading — that it marks an EMPTY SLOT and the list continues past it. If so this stops
+                // on the first hole, which is the same truncation `isSkippable` exists to prevent, one
+                // condition over. It cannot be settled without a strap, so instead of guessing we make
+                // the discrepancy loud: stopping here well short of the announced count is exactly the
+                // evidence that would settle it.
+                stopReason = "firmware reported validKey=false"
+                if let count = reportedCount, count > steps {
+                    stopReason = "firmware reported validKey=false at index \(r.index) after \(steps) of "
+                        + "\(count) announced entries — if validKey=0 marks an empty slot rather than the "
+                        + "end of the list, the remainder was NOT walked (see #872 review)"
+                }
+            }
             return false
+        }
+        if r.isSkippable {
+            // Our decode declined the name; the strap still says the entry is real and may have more after
+            // it. Count it so a partial dump describes itself instead of looking complete.
+            skipped += 1
+            trace[trace.count - 1] += "  (name did not decode — skipped, walk continues)"
         }
         if let k = r.key, !keys.contains(k) { keys.append(k) }
         // Bound the walk on REPLIES, not on distinct keys: a firmware whose cursor never advances would
@@ -318,6 +354,7 @@ public struct FeatureFlagProbeReport: Equatable, Sendable {
         if let stopReason { sb += "Stopped: \(stopReason)\n" }
         sb += "\nFlags reported by the strap (\(keys.count)"
         if let reportedCount { sb += " of \(reportedCount) announced" }
+        if skipped > 0 { sb += ", \(skipped) name(s) did not decode and were skipped" }
         sb += "):\n"
         if keys.isEmpty {
             sb += "  (none)\n"
@@ -337,8 +374,20 @@ public struct FeatureFlagProbeReport: Equatable, Sendable {
         if keys.isEmpty && reportedCount == nil {
             return "no usable reply — the enumerate path is unconfirmed on this firmware"
         }
+        // "named none" would blame the strap for OUR decode. If entries were skipped the strap did name
+        // them and this parser rejected the names, which is the opposite conclusion and the one a reader
+        // would carry into #103. Same class as `isSkippable`: never report our limitation as the strap's
+        // behaviour.
+        if keys.isEmpty && skipped > 0 {
+            return "strap named \(skipped) flag(s), none of which decoded as printable ASCII within "
+                + "\(FeatureFlagProbe.maxKeyLength) chars — this is our parser rejecting them, NOT the "
+                + "strap serving blanks; see the trace for the raw replies"
+        }
         if keys.isEmpty {
             return "strap announced \(reportedCount ?? 0) flag(s) but named none"
+        }
+        if skipped > 0 {
+            return "enumerated \(keys.count) feature-flag key name(s); \(skipped) further name(s) did not decode"
         }
         return "enumerated \(keys.count) feature-flag key name(s)"
     }

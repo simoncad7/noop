@@ -166,8 +166,108 @@ final class FeatureFlagProbeTests: XCTestCase {
         guard case .success(let r) = FeatureFlagProbe.parseNext(frame: frame, family: .whoop4) else {
             return XCTFail("expected a decoded NEXT response")
         }
-        XCTAssertNil(r.key)
-        XCTAssertTrue(r.isExhausted, "no decodable name ends the walk rather than inventing one")
+        XCTAssertNil(r.key, "a non-printable run is never invented into a name")
+        // Our decode declining a name is NOT the strap saying stop: the firmware still flagged this entry
+        // valid, so the walk steps over it instead of throwing away everything after it.
+        XCTAssertFalse(r.isExhausted)
+        XCTAssertTrue(r.isSkippable)
+    }
+
+    /// The regression this split exists for: one undecodable entry used to end the enumeration, so a list
+    /// with a bad byte in the middle reported only the keys BEFORE it. The first real capture is the
+    /// expensive one to obtain, and it is exactly the run that must not be truncated by our own strictness.
+    func testAnUndecodableEntryDoesNotHideTheKeysAfterIt() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        report.noteStart(FeatureFlagProbe.StartResponse(resultCode: 1, revision: 1, count: 4))
+
+        func next(_ index: Int, _ key: String?) -> FeatureFlagProbe.NextResponse {
+            FeatureFlagProbe.NextResponse(resultCode: 1, revision: 1, index: index, validKey: true, key: key)
+        }
+        XCTAssertTrue(report.noteNext(next(0, "enable_r22_packets")))
+        XCTAssertTrue(report.noteNext(next(1, nil)), "a bad name must not stop the walk")
+        XCTAssertTrue(report.noteNext(next(2, "sigproc_wear_detect")))
+        XCTAssertFalse(report.noteNext(
+            FeatureFlagProbe.NextResponse(resultCode: 1, revision: 1, index: 0xFF,
+                                          validKey: false, key: nil)))
+
+        XCTAssertEqual(report.keys, ["enable_r22_packets", "sigproc_wear_detect"],
+                       "the key after the undecodable entry is collected, not lost")
+        XCTAssertEqual(report.skipped, 1)
+        XCTAssertEqual(report.stopReason, "cursor exhausted (index 0xFF)")
+        XCTAssertTrue(report.render().contains("1 name(s) did not decode and were skipped"),
+                      "a dump with holes must describe itself rather than look complete")
+    }
+
+    /// `validKey = 0` is trusted as an end marker, but the other reading — an EMPTY SLOT with the list
+    /// continuing past it — is not ruled out by anything observed so far. Stopping well short of the
+    /// announced count is the evidence that would settle it, so the report has to say so loudly rather
+    /// than reporting a confident short list.
+    func testStoppingOnValidKeyFalseShortOfTheAnnouncedCountIsFlagged() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        report.noteStart(FeatureFlagProbe.StartResponse(resultCode: 1, revision: 1, count: 40))
+        XCTAssertTrue(report.noteNext(FeatureFlagProbe.NextResponse(
+            resultCode: 1, revision: 1, index: 0, validKey: true, key: "enable_r22_packets")))
+        XCTAssertFalse(report.noteNext(FeatureFlagProbe.NextResponse(
+            resultCode: 1, revision: 1, index: 1, validKey: false, key: nil)))
+
+        let why = try! XCTUnwrap(report.stopReason)
+        XCTAssertTrue(why.contains("2 of 40 announced entries"), why)
+        XCTAssertTrue(why.contains("the remainder was NOT walked"), why)
+    }
+
+    /// …and when the count was fully walked, the plain reason stands — no false alarm.
+    func testValidKeyFalseAtTheAnnouncedEndIsNotFlagged() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        report.noteStart(FeatureFlagProbe.StartResponse(resultCode: 1, revision: 1, count: 1))
+        XCTAssertFalse(report.noteNext(FeatureFlagProbe.NextResponse(
+            resultCode: 1, revision: 1, index: 0, validKey: false, key: nil)))
+        XCTAssertEqual(report.stopReason, "firmware reported validKey=false")
+    }
+
+    /// The verdict must never blame the strap for our own decode. A firmware whose names all fail our
+    /// printable-ASCII/length filter DID name them; reporting "named none" points at the strap and is the
+    /// sentence someone would paste into #103.
+    func testVerdictBlamesOurParserNotTheStrapWhenEveryNameFails() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        report.noteStart(FeatureFlagProbe.StartResponse(resultCode: 1, revision: 1, count: 3))
+        for i in 0..<3 {
+            _ = report.noteNext(FeatureFlagProbe.NextResponse(
+                resultCode: 1, revision: 1, index: i, validKey: true, key: nil))
+        }
+        XCTAssertTrue(report.keys.isEmpty)
+        XCTAssertEqual(report.skipped, 3)
+        let v = report.verdict
+        XCTAssertTrue(v.contains("strap named 3 flag(s)"), v)
+        XCTAssertTrue(v.contains("our parser rejecting them"), v)
+        XCTAssertFalse(v.contains("named none"), "must not report our limitation as the strap's behaviour")
+    }
+
+    /// A partial success says so in the headline too, not only in the flag-count line.
+    func testVerdictReportsSkippedAlongsideTheKeysItDidGet() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        report.noteStart(FeatureFlagProbe.StartResponse(resultCode: 1, revision: 1, count: 3))
+        _ = report.noteNext(FeatureFlagProbe.NextResponse(
+            resultCode: 1, revision: 1, index: 0, validKey: true, key: "enable_r22_packets"))
+        _ = report.noteNext(FeatureFlagProbe.NextResponse(
+            resultCode: 1, revision: 1, index: 1, validKey: true, key: nil))
+        XCTAssertEqual(report.verdict,
+                       "enumerated 1 feature-flag key name(s); 1 further name(s) did not decode")
+    }
+
+    /// The skip cannot become an unbounded walk: `maxFlags` still terminates a firmware that answers
+    /// forever with entries whose names never decode.
+    func testEveryReplyUndecodableStillStopsAtTheSafetyCap() {
+        var report = FeatureFlagProbeReport(family: .whoop4)
+        var sent = 0
+        while report.noteNext(FeatureFlagProbe.NextResponse(resultCode: 1, revision: 1, index: 0,
+                                                            validKey: true, key: nil)) {
+            sent += 1
+            XCTAssertLessThan(sent, FeatureFlagProbe.maxFlags + 2, "walk must not run away")
+        }
+        XCTAssertEqual(report.steps, FeatureFlagProbe.maxFlags)
+        XCTAssertEqual(report.skipped, FeatureFlagProbe.maxFlags)
+        XCTAssertEqual(report.stopReason, "safety cap of \(FeatureFlagProbe.maxFlags) replies reached")
+        XCTAssertTrue(report.keys.isEmpty)
     }
 
     func testKeyLongerThanTheSetSideFieldIsRejected() {

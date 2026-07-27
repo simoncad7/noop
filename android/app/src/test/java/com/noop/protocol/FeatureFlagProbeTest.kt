@@ -142,7 +142,104 @@ class FeatureFlagProbeTest {
         val frame = whoop4Response(118, payload(1, record))
         val r = FeatureFlagProbe.parseNext(frame, DeviceFamily.WHOOP4).value!!
         assertNull(r.key)
-        assertTrue(r.isExhausted)
+        // Our decode declining a name is NOT the strap saying stop: the firmware still flagged this entry
+        // valid, so the walk steps over it instead of throwing away everything after it.
+        assertFalse(r.isExhausted)
+        assertTrue(r.isSkippable)
+    }
+
+    /**
+     * The regression this split exists for: one undecodable entry used to end the enumeration, so a list
+     * with a bad byte in the middle reported only the keys BEFORE it. The first real capture is the
+     * expensive one to obtain, and it is exactly the run that must not be truncated by our own strictness.
+     */
+    @Test fun anUndecodableEntryDoesNotHideTheKeysAfterIt() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        report.noteStart(FeatureFlagProbe.StartResponse(1, 1, 4))
+        fun next(index: Int, key: String?) = FeatureFlagProbe.NextResponse(1, 1, index, true, key)
+
+        assertTrue(report.noteNext(next(0, "enable_r22_packets")))
+        assertTrue("a bad name must not stop the walk", report.noteNext(next(1, null)))
+        assertTrue(report.noteNext(next(2, "sigproc_wear_detect")))
+        assertFalse(report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 0xFF, false, null)))
+
+        assertEquals(listOf("enable_r22_packets", "sigproc_wear_detect"), report.keys)
+        assertEquals(1, report.skipped)
+        assertEquals("cursor exhausted (index 0xFF)", report.stopReason)
+        assertTrue(report.render().contains("1 name(s) did not decode and were skipped"))
+    }
+
+    /**
+     * `validKey = 0` is trusted as an end marker, but the other reading — an EMPTY SLOT with the list
+     * continuing past it — is not ruled out by anything observed so far. Stopping well short of the
+     * announced count is the evidence that would settle it, so the report has to say so loudly rather
+     * than reporting a confident short list.
+     */
+    @Test fun stoppingOnValidKeyFalseShortOfTheAnnouncedCountIsFlagged() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        report.noteStart(FeatureFlagProbe.StartResponse(1, 1, 40))
+        assertTrue(report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 0, true, "enable_r22_packets")))
+        assertFalse(report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 1, false, null)))
+
+        val why = report.stopReason!!
+        assertTrue(why, why.contains("2 of 40 announced entries"))
+        assertTrue(why, why.contains("the remainder was NOT walked"))
+    }
+
+    /** …and when the count was fully walked, the plain reason stands — no false alarm. */
+    @Test fun validKeyFalseAtTheAnnouncedEndIsNotFlagged() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        report.noteStart(FeatureFlagProbe.StartResponse(1, 1, 1))
+        assertFalse(report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 0, false, null)))
+        assertEquals("firmware reported validKey=false", report.stopReason)
+    }
+
+    /**
+     * The verdict must never blame the strap for our own decode. A firmware whose names all fail our
+     * printable-ASCII/length filter DID name them; reporting "named none" points at the strap and is the
+     * sentence someone would paste into #103.
+     */
+    @Test fun verdictBlamesOurParserNotTheStrapWhenEveryNameFails() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        report.noteStart(FeatureFlagProbe.StartResponse(1, 1, 3))
+        for (i in 0 until 3) {
+            report.noteNext(FeatureFlagProbe.NextResponse(1, 1, i, true, null))
+        }
+        assertTrue(report.keys.isEmpty())
+        assertEquals(3, report.skipped)
+        val v = report.verdict
+        assertTrue(v, v.contains("strap named 3 flag(s)"))
+        assertTrue(v, v.contains("our parser rejecting them"))
+        assertFalse("must not report our limitation as the strap's behaviour", v.contains("named none"))
+    }
+
+    /** A partial success says so in the headline too, not only in the flag-count line. */
+    @Test fun verdictReportsSkippedAlongsideTheKeysItDidGet() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        report.noteStart(FeatureFlagProbe.StartResponse(1, 1, 3))
+        report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 0, true, "enable_r22_packets"))
+        report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 1, true, null))
+        assertEquals(
+            "enumerated 1 feature-flag key name(s); 1 further name(s) did not decode",
+            report.verdict,
+        )
+    }
+
+    /**
+     * The skip cannot become an unbounded walk: [FeatureFlagProbe.MAX_FLAGS] still terminates a firmware
+     * that answers forever with entries whose names never decode.
+     */
+    @Test fun everyReplyUndecodableStillStopsAtTheSafetyCap() {
+        val report = FeatureFlagProbeReport(DeviceFamily.WHOOP4)
+        var sent = 0
+        while (report.noteNext(FeatureFlagProbe.NextResponse(1, 1, 0, true, null))) {
+            sent += 1
+            assertTrue("walk must not run away", sent < FeatureFlagProbe.MAX_FLAGS + 2)
+        }
+        assertEquals(FeatureFlagProbe.MAX_FLAGS, report.steps)
+        assertEquals(FeatureFlagProbe.MAX_FLAGS, report.skipped)
+        assertEquals("safety cap of ${FeatureFlagProbe.MAX_FLAGS} replies reached", report.stopReason)
+        assertTrue(report.keys.isEmpty())
     }
 
     @Test fun keyLongerThanTheSetSideFieldIsRejected() {
