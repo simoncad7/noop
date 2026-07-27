@@ -91,6 +91,25 @@ interface WhoopDao : DeviceRegistryDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertRawImu(rows: List<RawImuSampleEntity>): List<Long>
 
+    /**
+     * The remaining 5/MG v18 per-second fields, one compact blob per strap-second. Idempotent by
+     * (deviceId, ts) — IGNORE keeps the FIRST-seen row, matching every other per-second stream, so a
+     * re-sync cannot duplicate or overwrite. Instrumentation only.
+     */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertV18Aux(rows: List<V18AuxSampleEntity>): List<Long>
+
+    /**
+     * Bound the v18 aux table to the newest [keep] rows for [deviceId] (rolling retention, v31). Same
+     * shape as [pruneRawImu] — this is instrumentation nothing reads yet, so it is capped rather than
+     * unbounded. Swift twin: the DELETE at the end of `WhoopStore.insert`.
+     */
+    @Query(
+        "DELETE FROM v18AuxSample WHERE deviceId = :deviceId AND ts < " +
+            "(SELECT MIN(ts) FROM (SELECT ts FROM v18AuxSample WHERE deviceId = :deviceId ORDER BY ts DESC LIMIT :keep))"
+    )
+    suspend fun pruneV18Aux(deviceId: String, keep: Int)
+
     /** Bound the raw-IMU table to the newest [keep] rows for [deviceId] (rolling retention, #423). */
     @Query(
         "DELETE FROM rawImuSample WHERE deviceId = :deviceId AND ts < " +
@@ -288,6 +307,18 @@ interface WhoopDao : DeviceRegistryDao {
     )
     suspend fun ppgWaveformSamples(deviceId: String, from: Long, to: Long, limit: Int):
         List<PpgWaveformSampleEntity>
+
+    /**
+     * The banked 5/MG v18 auxiliary-field rows in [from, to] (ascending). Empty on a WHOOP 4.0 and for
+     * any window offloaded before the columns existed. INSTRUMENTATION: no analytic calls this — it
+     * exists so the banked bytes are reachable for a census, and so the write path has a round-trip test.
+     */
+    @Query(
+        "SELECT * FROM v18AuxSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "ORDER BY ts ASC LIMIT :limit"
+    )
+    suspend fun v18AuxSamples(deviceId: String, from: Long, to: Long, limit: Int):
+        List<V18AuxSampleEntity>
 
     /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
      *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77).
@@ -815,6 +846,23 @@ interface WhoopDao : DeviceRegistryDao {
 
     @Query("DELETE FROM spo2Sample WHERE ts < :minTs OR ts > :maxTs")
     suspend fun pruneSpo2ByTs(minTs: Long, maxTs: Long): Int
+
+    // The instrumentation streams landed AFTER this heal was written and were never added to it, so a
+    // bad-clock strap's garbage-ts rows survived in them while every sibling stream above was cleaned.
+    // They are keyed by the SAME `ts` from the SAME type-47 ingest path, so there is no reason to exempt
+    // them. Legacy-rows only in practice (the #547 ingest gate now rejects an implausible ts before it is
+    // banked), which is why it went unnoticed. Swift twin: TimestampHeal.rawTables.
+    @Query("DELETE FROM sleepStateSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneSleepStateByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM ppgWaveformSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun prunePpgWaveformByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM rawImuSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneRawImuByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM v18AuxSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneV18AuxByTs(minTs: Long, maxTs: Long): Int
 
     @Query("DELETE FROM event WHERE ts < :minTs OR ts > :maxTs")
     suspend fun pruneEventByTs(minTs: Long, maxTs: Long): Int
