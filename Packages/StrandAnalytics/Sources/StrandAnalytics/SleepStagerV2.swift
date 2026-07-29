@@ -5,7 +5,8 @@ import WhoopProtocol
 // percentile-band stager `SleepStager` (V1) after a 44-subject cross-subject benchmark; V1 stays available
 // behind the PuffinExperiment flag.
 //
-// Reimplemented clean from the contributor recipe in NoopApp/noop PR #600 (sunny-noop). We took only the
+// Reimplemented clean from @sunny-noop's contributor recipe (pre-fork PR #600 — NOT this repo's #600,
+// which is an iOS notification). We took only the
 // per-session STAGING engine, not the CLI runner the PR shipped with it. Session DETECTION (the in-bed
 // `[start, end]` spans) still comes entirely from V1 — this file only re-stages a window someone already
 // decided is sleep, so it is a true drop-in for `SleepStager.stageSession(start:end:grav:hr:rr:resp:)`:
