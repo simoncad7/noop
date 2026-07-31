@@ -471,6 +471,9 @@ public struct SourceBadge: View {
     let text: LocalizedStringKey; var tint: Color = StrandPalette.accent
     public init(_ text: LocalizedStringKey, tint: Color = StrandPalette.accent) { self.text = text; self.tint = tint }
     public var body: some View {
+        // `.frame(height:)` centres its content by default, so the label sits mid-capsule for free. Noted
+        // because the Android twin pinned the same 18 with `heightIn` applied to the label itself, which
+        // top-aligns — same number, different render. That one is matched to this, not the reverse.
         Text(text).textCase(.uppercase).font(.system(size: 10, weight: .semibold, design: .rounded)).tracking(0.5)
             .padding(.horizontal, 9).frame(height: NoopMetrics.sourceBadgeHeight)
             .background(tint.opacity(0.16), in: Capsule(style: .continuous))
