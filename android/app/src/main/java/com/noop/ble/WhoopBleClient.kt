@@ -538,6 +538,21 @@ class WhoopBleClient(
             else -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
         }
 
+        /**
+         * The `reason=` token for a connection-down trace line (#1020), pure so the composition is
+         * unit-testable without a BLE stack.
+         *
+         * A local teardown arrives as GATT status 22 and used to print the bare `localTerminate`, which
+         * five different paths of ours produce. [localTeardownOrigin] names which one; `unknown` when the
+         * drop was local but no path claimed it, which is itself worth seeing — it means a teardown route
+         * exists that is not tagged.
+         */
+        fun connectionDownReason(status: Int, localTeardownOrigin: String?): String = when (status) {
+            GATT_CONN_TIMEOUT -> "connectionTimeout"
+            GATT_CONN_TERMINATE_LOCAL_HOST -> "localTerminate via=${localTeardownOrigin ?: "unknown"}"
+            else -> "status$status"
+        }
+
         /** Pure battery-adaptive gate (#477), unit-testable without a BLE stack. Keyed on the STRAP's
          *  battery (WHOOP/Oura/Fitbit): the lever is ARMED by [thresholdPct] > 0 (the Settings slider is
          *  10–30; 0 disables it) and engages while the strap is DISCHARGING at/below [thresholdPct]. The
@@ -2515,6 +2530,7 @@ class WhoopBleClient(
      */
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        noteLocalTeardown("userDisconnect")   // #1020
         intentionalDisconnect = true
         handler.removeCallbacks(scanTimeoutRunnable)
         // #1030 (ryanbr): a user teardown supersedes any pending involuntary reconnect timer.
@@ -2668,6 +2684,7 @@ class WhoopBleClient(
      * `BLEManager.forgetDevice` (which iOS already wires from DevicesView's Remove). Runs on the main looper.
      */
     fun releaseStrap() {
+        noteLocalTeardown("releaseStrap")   // #1020
         handler.post {
             intentionalDisconnect = true     // defuse the disconnect→3s-reconnect loop's guard
             handler.removeCallbacks(scanTimeoutRunnable)
@@ -3971,6 +3988,35 @@ class WhoopBleClient(
      *  nag the user. Reset to 0 on any genuine bond. (5/MG firmware reset parity, 2026-06) */
     private var staleDirectFailures = 0
 
+    /**
+     * Which of OUR OWN paths last tore the link down, and when the current session started (#1020).
+     *
+     * A local teardown surfaces as GATT status 22 (`GATT_CONN_TERMINATE_LOCAL_HOST`), which the
+     * connection trace has always reported as the bare `reason=localTerminate`. At least five paths
+     * produce it — the bond watchdog, the keep-alive stall bounce, a user disconnect, releaseStrap, and
+     * a safeGatt teardown after a dead binder — and the log could not tell them apart. A report showing
+     * thousands of localTerminate reconnects (#1020) therefore could not be diagnosed from the log at
+     * all; the existing comment beside the reason string just guesses ("e.g. #971 bond watchdog").
+     *
+     * Set at each initiating site, cleared when a new session comes up, and printed alongside the
+     * reason. @Volatile because the setters run on the main looper and timer callbacks while
+     * handleDisconnect reads it from a GATT binder thread on API 26/27.
+     */
+    @Volatile private var lastLocalTeardown: String? = null
+
+    /** Wall clock when the current session reached STATE_CONNECTED, for the session-duration readout.
+     *  0 until the first connect; set on EVERY connect (not gated on the test mode, which is usually
+     *  switched on only after something looks wrong) and never cleared on the way down, so read it only
+     *  under a `wasConnected` guard. @Volatile for the same reason as [lastLocalTeardown]. */
+    @Volatile private var connectedAtMs = 0L
+
+    /** Record which local path is about to drop the link. Unconditional rather than gated on the test
+     *  mode, because the clear in the connect path is ungated too - gating one and not the other is what
+     *  let a previous session's origin survive. Four of the five call sites pass a literal; `safeGatt`
+     *  interpolates the failing op, but that is an exception path where a String allocation is noise
+     *  against the teardown it is about to perform. None of the five is on a per-record path. */
+    private fun noteLocalTeardown(origin: String) { lastLocalTeardown = origin }
+
     /** Consecutive involuntary reconnect attempts, feeding the capped-exponential [ReconnectBackoff]
      *  (3, 6, 12, 24, 48, 60s…). Replaces the old fixed [RECONNECT_DELAY_MS] rescan loop so a strap
      *  that's genuinely out of range stops hammering BLE — the Android twin of the iOS
@@ -4097,6 +4143,7 @@ class WhoopBleClient(
         // through to a clean teardown if it does (mirrors the keep-alive bounce). When we gave up above,
         // [handleDisconnect] takes its paused branch and schedules NO reconnect; otherwise it backoff-
         // reconnects and [armBondWatchdog] arms the NEXT (wider) window from [bondWatchdogBackoff].
+        noteLocalTeardown("bondWatchdog")   // #1020: name the origin of the localTerminate that follows
         try {
             gatt?.disconnect()   // → handleDisconnect → reset() (cancels this) → (paused | backoff reconnect)
         } catch (t: Throwable) {
@@ -4418,6 +4465,13 @@ class WhoopBleClient(
                     // Connection test mode: report the connect latency + the uptime-start marker the readout
                     // reads. Gated zero-cost (the CONNECTION bool is read before any string is built).
                     // Behaviour-neutral diagnostics only - the connect flow below is unchanged. Twin of macOS.
+                    // #1020: both stamped OUTSIDE the gate. Test Centre is usually switched on AFTER
+                    // something looks wrong, and noteLocalTeardown() writes are themselves ungated - so a
+                    // clear that only ran when the mode was already on would let a PREVIOUS session's origin
+                    // survive, printing a stale via=bondWatchdog where via=unknown is the honest answer.
+                    // Field assignments, not log lines: no cost when the mode is off.
+                    connectedAtMs = System.currentTimeMillis()
+                    lastLocalTeardown = null
                     if (testCentre.active(com.noop.testcentre.TestDomain.CONNECTION)) {
                         val nowUnix = System.currentTimeMillis() / 1000L
                         val latencyMs = connectAttemptStartedAtMs?.let { System.currentTimeMillis() - it }
@@ -5473,6 +5527,7 @@ class WhoopBleClient(
                 // Nothing for the fuse window — the live stream/link stalled. Bounce it: the auto-rescan on
                 // disconnect re-bonds and resumes streaming (the automatic version of the manual fix).
                 log("No data for ${silentMs / 1000}s — bouncing link to resume live stream")
+                noteLocalTeardown("keepAliveStall")   // #1020
                 intentionalDisconnect = false    // make sure the auto-reconnect fires
                 // disconnect() throwing on a dead binder (#314) would crash from the keep-alive timer;
                 // tear down directly so the bounce degrades to a clean disconnect.
@@ -6846,6 +6901,7 @@ class WhoopBleClient(
             // policy (always tear down) is single-sourced in shouldTeardownOnGattThrow so it's testable.
             if (shouldTeardownOnGattThrow(t)) {
                 log("GATT op '$reason' failed (${t.javaClass.simpleName}); tearing down link")
+                noteLocalTeardown("gattThrow:$reason")   // #1020
                 teardownAfterGattFailure()
             }
             false
@@ -7049,13 +7105,14 @@ class WhoopBleClient(
             //    so the reconnect-churn count means the same thing on both platforms.
             if (wasConnected) connReconnectCount += 1
             if (testCentre.active(com.noop.testcentre.TestDomain.CONNECTION)) {
-                val reason = when (status) {
-                    GATT_CONN_TIMEOUT -> "connectionTimeout"
-                    GATT_CONN_TERMINATE_LOCAL_HOST -> "localTerminate"   // our own bounce (e.g. #971 bond watchdog)
-                    else -> "status$status"
-                }
+                // #1020: `via=` names WHICH of our own paths dropped it — bondWatchdog, keepAliveStall,
+                // userDisconnect, releaseStrap or gattThrow:<op>. Five paths produced one string before,
+                // which made a thousands-of-reconnects report undiagnosable from the log alone.
+                val reason = connectionDownReason(status, lastLocalTeardown)
                 if (wasConnected) {
-                    log("connect down (uptime ends)", com.noop.testcentre.TestDomain.CONNECTION)
+                    val heldMs = if (connectedAtMs > 0L) System.currentTimeMillis() - connectedAtMs else -1L
+                    log("connect down (uptime ends${com.noop.analytics.ConnectionTrace.sessionHeldSuffix(heldMs)})",
+                        com.noop.testcentre.TestDomain.CONNECTION)
                     log("reconnect n=$connReconnectCount reason=$reason", com.noop.testcentre.TestDomain.CONNECTION)
                 } else {
                     log("reconnect n=$connReconnectCount failedConnect reason=$reason", com.noop.testcentre.TestDomain.CONNECTION)

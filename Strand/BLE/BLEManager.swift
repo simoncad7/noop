@@ -618,6 +618,16 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Count of INVOLUNTARY reconnects this run (a drop or failed-connect that was not user-initiated),
     /// surfaced as the reconnect-churn count. Reset by an intentional disconnect.
     private var connReconnectCount = 0
+    /// When the current session reached connected, for the `connect down` duration readout (#1020).
+    /// A session's length separates the causes of a drop at a glance — a bond watchdog fires seconds
+    /// in, a stall bounce minutes in, a radio drop anywhere.
+    ///
+    /// Set on EVERY connect, not only when the connection test mode is active: the mode is usually
+    /// switched on after something already looks wrong, so a stamp taken under the gate would carry a
+    /// previous session's start. Never cleared on the way down, so read it only where a session is known
+    /// to have been held (`didDisconnectPeripheral`, which fires only for a peripheral that connected).
+    /// Android twin: `WhoopBleClient.connectedAtMs`.
+    private var connSessionStartedAt: Date?
     /// #126 false-alarm guard: tracks CONSECUTIVE console-only completed syncs so the "clock has lost
     /// sync" banner only fires on sustained emptiness, not a single transient empty cycle on a healthy strap.
     private var emptySyncTracker = EmptySyncTracker()
@@ -3918,6 +3928,11 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         }
         lastDataAt = Date()
         log("Connected — discovering services")
+        // #1020: stamped OUTSIDE the gate below. Test Centre is usually switched on AFTER something looks
+        // wrong, so a stamp taken only when the mode happened to be on at connect time would either be
+        // missing or, worse, still hold a PREVIOUS session's start - reporting a duration that spans the
+        // gap between them. A field assignment, not a log line, so it costs nothing when the mode is off.
+        connSessionStartedAt = Date()
         // Connection test mode: report the connect latency + the uptime-start marker the readout reads.
         // Gated zero-cost: the .connection bool is read before any string is built, so this is a no-op
         // when the mode is off. Behaviour-neutral diagnostics only - the connect flow above is unchanged.
@@ -4103,7 +4118,11 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             if TestCentre.active(.connection) {
                 let reason = (error as? CBError)?.code == .connectionTimeout
                     ? "connectionTimeout" : connErrorToken(error)
-                state.append(log: "connect down (uptime ends)", domain: .connection)
+                // #1020: the session's length separates the causes of a drop at a glance. Same suffix the
+                // Android twin emits, so the shared ConnectionReadout parser sees one format.
+                let held = ConnectionTrace.sessionHeldSuffix(
+                    millis: connSessionStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? -1)
+                state.append(log: "connect down (uptime ends\(held))", domain: .connection)
                 state.append(log: "reconnect n=\(connReconnectCount) reason=\(reason)", domain: .connection)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
