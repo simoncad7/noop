@@ -1733,15 +1733,26 @@ class WhoopRepository(private val dao: WhoopDao) {
             return s == "manual" || s.endsWith("-noop")
         }
 
-        /** #510: the device id whose `hrSample` rows back a workout's Avg HR / calories / Effort recompute.
-         *  A STRAP-NATIVE row was charted from its OWN strap's trace, so read HR under that strap — strip the
-         *  computed "-noop" suffix to reach the raw hrSample id (a detected row lives under "<id>-noop", its
-         *  HR under "<id>"). An IMPORTED row has no strap HR of its own; #77 fills it from the WORN strap, i.e.
-         *  the active strap [activeStrapId]. Before this both keyed on a hardcoded "my-whoop", so a strap-native
-         *  workout on a SECOND WHOOP ("whoop-<mac>") read an empty window — its Avg HR went un-reconciled and a
-         *  null Effort un-recomputed. (This fill only sets avgHr/maxHr/strain; calories come from the detector.) */
+        /** A workout row is DETECTED when the engine scored it from a strap trace it recorded itself
+         *  (source "<id>-noop"). This is the strict subset of [isStrapNativeWorkout] that actually carries
+         *  its own recording strap id — a "manual" row does not (see [workoutHrDeviceIds]). */
+        fun isDetectedWorkout(source: String): Boolean = source.lowercase().endsWith("-noop")
+
+        /** #510/#836: the device id(s) whose `hrSample` rows back a workout's Avg HR / calories / Effort
+         *  recompute. A DETECTED row was charted from its OWN strap's trace, so read HR under that strap —
+         *  strip the computed "-noop" suffix to reach the raw hrSample id (a detected row lives under
+         *  "<id>-noop", its HR under "<id>"). Everything else — a MANUAL row or an IMPORTED one — has no
+         *  strap trace of its own to point at: a manual row's stored deviceId is just "my-whoop", a
+         *  retroactive-add placeholder ([com.noop.ui.WorkoutEditing.buildManualRow]), not the strap that was
+         *  actually worn. So both read the #814 UNION via [importedSourceIdsFor] (active strap ∪ canonical
+         *  "my-whoop", active first) — the same window #77 fills IMPORTED rows from. Byte-identical to the
+         *  Swift twin (`Repository.workoutHrDeviceIds`), which has always kept only DETECTED on the single-id
+         *  path. Before this fix, a manual row read "my-whoop" verbatim, so a manual workout on a SECOND WHOOP
+         *  ("whoop-<mac>") or any re-added strap read an empty window — its Avg HR went un-reconciled and a
+         *  null Effort un-recomputed (#836). A single-WHOOP install still resolves to one id, so nothing
+         *  changes there. (This fill only sets avgHr/maxHr/strain; calories come from the detector.) */
         fun workoutHrDeviceIds(source: String, rowDeviceId: String, activeStrapId: String): List<String> =
-            if (isStrapNativeWorkout(source)) listOf(rowDeviceId.removeSuffix("-noop"))
+            if (isDetectedWorkout(source)) listOf(rowDeviceId.removeSuffix("-noop"))
             else importedSourceIdsFor(activeStrapId)
 
         /** Default row cap on range reads. Matches the Swift call sites' bounded scans. */

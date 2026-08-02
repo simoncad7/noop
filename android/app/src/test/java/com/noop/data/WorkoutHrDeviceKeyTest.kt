@@ -48,10 +48,14 @@ class WorkoutHrDeviceKeyTest {
         )
     }
 
-    @Test fun `manual row reads HR under its own strap id`() {
+    @Test fun `manual row reads HR under the active union, not its stored placeholder id`() {
+        // #836: a manual row's stored deviceId is a retroactive-add placeholder ("my-whoop"), not the
+        // strap that was actually worn — so, like an imported row, it reads the #814 union (active
+        // strap first, canonical "my-whoop" second). Byte-parity with the Swift twin, which has always
+        // kept manual rows off the single-id path.
         assertEquals(
-            "whoop-aabbcc",
-            WhoopRepository.workoutHrDeviceIds("manual", "whoop-aabbcc", activeStrapId = "my-whoop").first(),
+            listOf("whoop-aabbcc", "my-whoop"),
+            WhoopRepository.workoutHrDeviceIds("manual", "whoop-aabbcc", activeStrapId = "whoop-aabbcc"),
         )
     }
 
@@ -68,10 +72,24 @@ class WorkoutHrDeviceKeyTest {
     }
 
     @Test fun `a bare strap id with no -noop suffix is returned unchanged`() {
-        // removeSuffix is a no-op when the suffix is absent — a manual/base id must not be truncated.
+        // removeSuffix is a no-op when the suffix is absent — a detected row's base id must not be
+        // truncated. (Only detected rows carry rowDeviceId into the read key at all; see the manual/
+        // imported cases above for the union path.)
         assertEquals(
             "whoop-aabbcc",
-            WhoopRepository.workoutHrDeviceIds("manual", "whoop-aabbcc", activeStrapId = "ignored").first(),
+            WhoopRepository.workoutHrDeviceIds("whoop-aabbcc-noop", "whoop-aabbcc", activeStrapId = "ignored").first(),
+        )
+    }
+
+    @Test fun `manual workout on a re-added strap reads the active union, not the stale my-whoop`() {
+        // #836/#928 (bartmuskala): a manual workout is always stored under deviceId "my-whoop"
+        // (WorkoutEditing.buildManualRow), regardless of which strap actually recorded the live HR. On a
+        // re-added or second strap, the live trace banks under the strap's fresh id ("whoop-aabbcc"), not
+        // under "my-whoop" — so reading only "my-whoop" (the pre-fix behaviour) hit an empty window and
+        // left Avg HR / Effort blank. The union reads the active strap first, so it finds the trace.
+        assertEquals(
+            listOf("whoop-aabbcc", "my-whoop"),
+            WhoopRepository.workoutHrDeviceIds("manual", rowDeviceId = "my-whoop", activeStrapId = "whoop-aabbcc"),
         )
     }
 }
