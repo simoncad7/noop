@@ -1879,4 +1879,5 @@
         <item quantity="one">Construction de votre référence. Encore environ %1$d nuit avant que vos scores soient personnels.</item>
         <item quantity="other">Construction de votre référence. Encore environ %1$d nuits avant que vos scores soient personnels.</item>
     </plurals>
+    <string name="l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb">Les widgets n\'inventent plus de chiffres, les siestes comptent pour la dette de sommeil, et les indicateurs Android parlent votre langue</string>
 </resources>

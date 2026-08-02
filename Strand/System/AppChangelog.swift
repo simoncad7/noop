@@ -7,7 +7,7 @@ enum AppChangelog {
 
     /// Bump this when you add a release below. The "What's New" sheet shows automatically when the
     /// stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
-    static let currentVersion = "9.3.0"
+    static let currentVersion = "9.3.1"
 
     struct Release: Identifiable {
         let version: String
@@ -19,6 +19,18 @@ enum AppChangelog {
 
     /// Newest first.
     static let releases: [Release] = [
+        Release(
+            version: "9.3.1",
+            title: "Widgets stop inventing numbers, naps count toward sleep debt, and the Android status chips speak your language",
+            date: "August 2026",
+            items: [
+                "**iPhone widgets showed made-up numbers (#887).** A Home Screen widget that could not read your data fell back to the gallery sample — 72% Charge, 58 bpm, 84% battery — for everyone. It now shows dashes when there is nothing to show, and sample values appear only in the widget gallery.",
+                "**Naps count toward sleep debt (#1041).** A separately-recorded nap now repays debt with its actual asleep minutes. Your debt figure will drop on days you napped, including days already in your history. Rest and the sleep headline still describe the main night only.",
+                "**Manual workouts on a second or re-added strap get their Avg HR back (#836).** A workout logged by hand read its heart rate from a placeholder id, so on a WHOOP 5.0 or a re-paired strap it found an empty window and left Avg HR and Effort blank.",
+                "**A connected strap no longer says it is disconnected (#612).** When the link is up but nothing is arriving, the chip said \"Not recording. Strap not connected\", which was simply false. It now says \"Connected\" and explains what is missing — and on Android that chip, and the score-state card beside it, are finally translated instead of always English.",
+                "**Effort agrees with itself on Today (#1001).** The hero ring knew about the morning's climb while the Key Metrics tile and the chart badge still read the overnight row, so the same day showed 2.3 in one place and 0.5 in two others.",
+            ]
+        ),
         Release(
             version: "9.3.0",
             title: "Water and caffeine from Apple Health, a sharper Effort score, and an Oura resting-heart-rate fix",
