@@ -66,11 +66,11 @@ class DecoderGoldenTest {
         val ibis = OuraDecoders.decodeSpO2IBI(rec)
         assertEquals(
             listOf(
-                OuraIBI(ringTimestamp = rt, ibiMs = 400),
-                OuraIBI(ringTimestamp = rt, ibiMs = 320),
-                OuraIBI(ringTimestamp = rt, ibiMs = 240),
-                OuraIBI(ringTimestamp = rt, ibiMs = 160),
-                OuraIBI(ringTimestamp = rt, ibiMs = 80),
+                OuraIBI(ringTimestamp = rt, ibiMs = 400, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 320, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 240, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 160, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 80, channel = OuraIbiChannel.SPO2_IBI),
             ),
             ibis,
         )

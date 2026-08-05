@@ -59,11 +59,11 @@ final class DecoderGoldenTests: XCTestCase {
         let rec = record("6e0a02000100000a141e2832")
         let ibis = OuraDecoders.decodeSpO2IBI(rec)
         XCTAssertEqual(ibis, [
-            OuraIBI(ringTimestamp: rt, ibiMs: 400),
-            OuraIBI(ringTimestamp: rt, ibiMs: 320),
-            OuraIBI(ringTimestamp: rt, ibiMs: 240),
-            OuraIBI(ringTimestamp: rt, ibiMs: 160),
-            OuraIBI(ringTimestamp: rt, ibiMs: 80),
+            OuraIBI(ringTimestamp: rt, ibiMs: 400, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 320, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 240, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 160, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 80, channel: .spo2Ibi),
         ])
     }
 

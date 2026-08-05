@@ -170,7 +170,8 @@ extension WhoopStore {
             }
             if !streams.rr.isEmpty {
                 let stmt = try db.cachedStatement(sql: """
-                    INSERT INTO rrInterval (deviceId, ts, rrMs, seq, ord) VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO rrInterval (deviceId, ts, rrMs, seq, ord, srcChannel)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, ts, rrMs, seq) DO NOTHING
                     """)
                 // v24 (#163): number EQUAL (ts, rrMs) beats 0, 1, … within this batch so both survive;
@@ -185,6 +186,15 @@ extension WhoopStore {
                 // batch-local caveat as seq: a second split across two live flushes restarts ord at 0 and
                 // DO NOTHING keeps the first row. The historical path delivers a second atomically.
                 // Twin of Kotlin assignRrSeq.
+                //
+                // v32 (#1071): `srcChannel` is the sensor channel that measured the beat, carried from the
+                // decoder that produced it. NULL for every WHOOP row (one beat source — there is no channel
+                // to name, and that is honest rather than a placeholder) and for any source that does not
+                // report one. Like `ord` it is OUTSIDE the key: two channels measuring the same beat can
+                // yield the same (ts, rrMs), and keying on the label would store both — which is precisely
+                // the double-count this fixes. `DO NOTHING` therefore keeps whichever arrived first and the
+                // second channel's copy of THAT exact beat is dropped at insert; the read filter is what
+                // separates the streams in general.
                 var seqByTsRr: [Int: [Int: Int]] = [:]
                 var ordByTs: [Int: Int] = [:]
                 for r in streams.rr {
@@ -192,7 +202,8 @@ extension WhoopStore {
                     seqByTsRr[r.ts, default: [:]][r.rrMs] = seq + 1
                     let ord = ordByTs[r.ts] ?? 0
                     ordByTs[r.ts] = ord + 1
-                    try stmt.execute(arguments: [deviceId, r.ts, r.rrMs, seq, ord])
+                    try stmt.execute(arguments: [deviceId, r.ts, r.rrMs, seq, ord,
+                                                 r.srcChannel?.rawValue])
                     rr += db.changesCount
                 }
             }
@@ -404,6 +415,12 @@ extension WhoopStore {
             // rr: stream=rr → rr_ms (col 4). Same-second beats need the #823 tiebreak here too, and
             // more so: bare "ORDER BY ts" left their order UNDEFINED, so a raw export could differ
             // between runs over identical data. Emission order first, then the pre-v30 fallback.
+            //
+            // DELIBERATELY UNFILTERED by `srcChannel`, unlike the scoring read (#1071). This is the raw
+            // dump: both optical channels are real measurements, and the whole point of keeping the
+            // second one is that it can be inspected against the first. A raw export that silently hid
+            // half the stored rows would make the duplication that motivated v32 un-diagnosable from an
+            // export — which is exactly how it WAS diagnosed.
             for r in try Row.fetchAll(db, sql:
                 "SELECT ts, rrMs FROM rrInterval WHERE deviceId = ? AND ts >= ? " +
                 "ORDER BY ts, ord, rrMs, seq",
@@ -658,6 +675,18 @@ extension WhoopStore {
                 SELECT ord FROM rrInterval WHERE deviceId = ? AND ts = ?
                 ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC
                 """, arguments: [deviceId, ts]).map { $0["ord"] }
+        }
+    }
+
+    /// Every STORED R-R row for a device as `(rrMs, srcChannel)`, bypassing the scoring read's channel
+    /// filter. Test-only (#1071): the fix is "filter at read, keep both channels on disk", and the only
+    /// way to assert the second half is to look at the table itself rather than through `rrIntervals`.
+    public func rrRowsWithChannelForTest(deviceId: String) async throws -> [(rrMs: Int, srcChannel: Int?)] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT rrMs, srcChannel FROM rrInterval WHERE deviceId = ?
+                ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC
+                """, arguments: [deviceId]).map { (rrMs: $0["rrMs"], srcChannel: $0["srcChannel"]) }
         }
     }
 }

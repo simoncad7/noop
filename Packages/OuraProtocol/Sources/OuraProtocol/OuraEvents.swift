@@ -10,13 +10,40 @@ import Foundation
 // (OuraStreamMapping) apply the anchor. Honest-data invariant: a short/malformed record decodes to
 // nil upstream, so these structs only ever hold real decoded values.
 
+/// WHICH optical channel decoded an `OuraIBI` (#1071).
+///
+/// The ring reports the SAME heartbeats on more than one tag. They are not different beats and not
+/// duplicate records — they are independent measurements of one beat train, so a consumer that folds
+/// them together holds two copies of every night and every variability statistic built on successive
+/// differences (RMSSD, SDNN) breaks. The tag is the only thing that separates them at ingest; after the
+/// fact the two are only separable by the accident that their quantisation grids differ.
+///
+/// The raw values are the DURABLE cross-platform storage codes (they reach `rrInterval.srcChannel` via
+/// `WhoopProtocol.RRSourceChannel`, which pins the same numbers, and the Kotlin twin `OuraIbiChannel`).
+/// Never renumber a case; only append.
+public enum OuraIBIChannel: Int, Equatable, Sendable, Codable, CaseIterable {
+    /// 0x80 `green_ibi_quality_event` (s6.4) — green LED, gated on the ring's own `quality == 1` flag
+    /// and a 300-2000 ms physiological window, and it runs for the WHOLE wear period.
+    case greenQuality = 1
+    /// 0x6E `spo2_ibi_and_amplitude_event` (s6.3) — the SpO2 measurement's own beat train, quantised to
+    /// an 8 ms grid with NO quality gate, and only present while an SpO2 measurement is running.
+    case spo2Ibi = 2
+    /// 0x60 / 0x44 `ibi_and_amplitude_event` (s6.1) — the bit-packed IBI + amplitude family.
+    case ibiAmplitude = 3
+}
+
 /// One decoded inter-beat interval (and optional amplitude), in milliseconds.
 public struct OuraIBI: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let ibiMs: Int
     public let amplitude: Int?
-    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil) {
+    /// Which optical channel measured this beat (#1071). Every decoder stamps its own; nil only for a
+    /// value built by something that is not one of them.
+    public let channel: OuraIBIChannel?
+    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil,
+                channel: OuraIBIChannel? = nil) {
         self.ringTimestamp = ringTimestamp; self.ibiMs = ibiMs; self.amplitude = amplitude
+        self.channel = channel
     }
 }
 

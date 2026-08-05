@@ -98,7 +98,8 @@ public enum OuraDecoders {
         for k in 0..<6 {
             guard ibi[k] > 0 else { continue }                 // drop a zero IBI, never invent one
             let amp = (Int(b[6 + k]) >> 1) << shift            // 7-bit mantissa << exponent
-            out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi[k], amplitude: amp))
+            out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi[k], amplitude: amp,
+                               channel: .ibiAmplitude))
         }
         return out.isEmpty ? nil : out
     }
@@ -165,7 +166,8 @@ public enum OuraDecoders {
             let ibi = (Int(b[i + 1]) & 0x07) | (Int(b[i]) << 3)   // high byte first
             let quality = (Int(b[i + 1]) >> 3) & 0x03
             if quality == 1 && ibi >= 300 && ibi <= 2000 {
-                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi))
+                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi,
+                                   channel: .greenQuality))
             }
             i += 2
             sampleCount += 1
@@ -192,7 +194,7 @@ public enum OuraDecoders {
         while idx >= 1 {
             let ibi = Int(b[idx]) * 8                  // 8-bit count x8 -> ms
             if ibi > 0 {
-                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi))
+                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi, channel: .spo2Ibi))
             }
             idx -= 1
         }

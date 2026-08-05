@@ -1,6 +1,8 @@
 package com.noop.data
 
 import com.noop.oura.OuraEvent
+import com.noop.oura.OuraIbiChannel
+import com.noop.protocol.RrSourceChannel
 import com.noop.protocol.SkinTempSample
 import com.noop.protocol.Spo2Sample
 import com.noop.protocol.Streams
@@ -58,7 +60,17 @@ object OuraStreamMapping {
 
                 is OuraEvent.Ibi -> {
                     val ts = anchor(ev.value.ringTimestamp) ?: continue
-                    out.rr.add(com.noop.protocol.RrInterval(ts, ev.value.ibiMs))
+                    // Carry the decoder's OWN channel tag onto the durable row (#1071). The ring reports
+                    // the same heartbeats on more than one tag — 0x80 green-quality all night, 0x6E only
+                    // while an SpO2 measurement runs — and both decode to Ibi, so an untagged store held
+                    // roughly TWO complete copies of every night (measured 2.06x beats and 2.17x
+                    // sum(rrMs)/wall-clock over one 488-min window). Both rows are real measurements, so
+                    // neither is dropped here; the scoring READ (WhoopDao.rrIntervals) picks one channel
+                    // and the other stays on disk as its cross-check. Null stays null — never a guess.
+                    // Mirrors the Swift OuraStreamMapping twin.
+                    out.rr.add(
+                        com.noop.protocol.RrInterval(ts, ev.value.ibiMs, rrChannel(ev.value.channel)),
+                    )
                 }
 
                 is OuraEvent.Hrv -> {
@@ -161,5 +173,21 @@ object OuraStreamMapping {
             }
         }
         return out
+    }
+
+    /**
+     * Translate the protocol layer's [OuraIbiChannel] to the store's [RrSourceChannel] (#1071).
+     *
+     * Two enums rather than one because `com.noop.oura` is the pure ring decoder and does not depend on
+     * the storage carriers — the same split the Swift twin has between `OuraProtocol` and
+     * `WhoopProtocol`. They pin the SAME [OuraIbiChannel.code] / [RrSourceChannel.code] values, and the
+     * mapping is written out case by case rather than as `fromCode(c.code)` so that adding a case on one
+     * side without the other is a COMPILE error instead of a silent null. Internal for the parity test.
+     */
+    internal fun rrChannel(c: OuraIbiChannel?): RrSourceChannel? = when (c) {
+        OuraIbiChannel.GREEN_QUALITY -> RrSourceChannel.GREEN_QUALITY
+        OuraIbiChannel.SPO2_IBI -> RrSourceChannel.SPO2_IBI
+        OuraIbiChannel.IBI_AMPLITUDE -> RrSourceChannel.IBI_AMPLITUDE
+        null -> null
     }
 }

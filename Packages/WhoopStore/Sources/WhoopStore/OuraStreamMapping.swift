@@ -65,7 +65,14 @@ public enum OuraStreamMapping {
                 out.hr.append(HRSample(ts: ts, bpm: v.bpm))
 
             case .ibi(let v):
-                out.rr.append(RRInterval(ts: ts, rrMs: v.ibiMs))
+                // Carry the decoder's OWN channel tag onto the durable row (#1071). The ring reports the
+                // same heartbeats on more than one tag — 0x80 green-quality all night, 0x6E only while an
+                // SpO2 measurement runs — and both decode to `.ibi`, so an untagged store held roughly TWO
+                // complete copies of every night (measured 2.06x beats and 2.17x sum(rrMs)/wall-clock over
+                // one 488-min window). Both rows are real measurements, so neither is dropped here; the
+                // scoring READ (`Reads.rrIntervals`) picks one channel and the other stays on disk as its
+                // cross-check. Nil stays nil — a channel is never guessed.
+                out.rr.append(RRInterval(ts: ts, rrMs: v.ibiMs, srcChannel: rrChannel(v.channel)))
 
             case .hrv(let v):
                 // The ring's own 0x5D tag, carried RAW for diagnostics/parity. The two int8 fields
@@ -142,5 +149,20 @@ public enum OuraStreamMapping {
             }
         }
         return out
+    }
+
+    /// Translate the protocol layer's `OuraIBIChannel` to the store's `RRSourceChannel` (#1071).
+    ///
+    /// Two enums rather than one because `OuraProtocol` deliberately does not depend on `WhoopProtocol`
+    /// (it is the pure, Linux-buildable ring decoder). They pin the SAME raw values, and the mapping is
+    /// written out case by case rather than as `RRSourceChannel(rawValue:)` so that adding a case on one
+    /// side without the other is a COMPILE error instead of a silent nil. Exposed for the parity test.
+    public static func rrChannel(_ c: OuraIBIChannel?) -> RRSourceChannel? {
+        switch c {
+        case .greenQuality:  return .greenQuality
+        case .spo2Ibi:       return .spo2Ibi
+        case .ibiAmplitude:  return .ibiAmplitude
+        case nil:            return nil
+        }
     }
 }

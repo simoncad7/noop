@@ -107,7 +107,12 @@ object OuraDecoders {
         for (k in 0 until 6) {
             if (ibi[k] <= 0) continue                      // drop a zero IBI, never invent one
             val amp = ((b[6 + k] and 0xFF) shr 1) shl shift   // 7-bit mantissa << exponent
-            out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp))
+            out.add(
+                OuraIBI(
+                    ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp,
+                    channel = OuraIbiChannel.IBI_AMPLITUDE,
+                ),
+            )
         }
         return if (out.isEmpty()) null else out
     }
@@ -181,7 +186,12 @@ object OuraDecoders {
             val ibi = (b[i + 1] and 0x07) or ((b[i] and 0xFF) shl 3)   // high byte first
             val quality = (b[i + 1] shr 3) and 0x03
             if (quality == 1 && ibi in 300..2000) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.GREEN_QUALITY,
+                    ),
+                )
             }
             i += 2
             sampleCount += 1
@@ -210,7 +220,12 @@ object OuraDecoders {
         while (idx >= 1) {
             val ibi = b[idx] * 8                          // 8-bit count x8 -> ms
             if (ibi > 0) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.SPO2_IBI,
+                    ),
+                )
             }
             idx -= 1
         }
