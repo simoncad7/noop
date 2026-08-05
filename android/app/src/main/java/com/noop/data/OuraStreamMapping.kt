@@ -95,8 +95,30 @@ object OuraStreamMapping {
                     // raw value goes in `red`; `ir` stays 0 (an unread channel, never a fabricated
                     // second reading). `unit` carries the decoder's own scale tag so downstream never
                     // assumes a percentage, mirroring the Swift twin's SpO2Sample(unit:).
+                    //
+                    // Each sample gets its OWN second. `spo2Sample` is keyed (deviceId, ts), so the 13
+                    // samples of one 0x6F record written at the record's single `ts` collided and only the
+                    // first survived — 92% of an overnight silently discarded, and unrecoverable because
+                    // the ring trims its banked history once the offload is acked (#1070). The samples are
+                    // one per second (measured: 13 values per packet at a 13 s median packet interval,
+                    // p10 12 / p90 14, so they tile the interval at exactly 1 Hz), and they are laid
+                    // BACKWARD from the record time — the record envelope marks the WRITE moment, so the
+                    // LAST sample keeps the record's own `ts` and the anchor semantics are unchanged.
+                    // `count == 1` (0x7B, and any single-sample record) yields offset 0, i.e. exactly the
+                    // previous behaviour. PARITY: the Swift twin computes the IDENTICAL second.
+                    //
+                    // This is collision-RARE, not collision-proof. The cadence has a tight tail (p10 12 s),
+                    // and a 12 s gap between two 13-sample records makes the newer record's FIRST second
+                    // equal the older record's last, costing one sample at that boundary. Measured over the
+                    // same overnight: 204 of 1,877 adjacent pairs overlap, by exactly 1 s each, so 204 of
+                    // 24,405 samples (0.84 %) are lost — against 92.3 % before. The insert ignores the
+                    // conflict rather than replacing, so the survivor is the older record's last sample,
+                    // which is the anchor-exact one; what is dropped is the newer record's most
+                    // back-extrapolated sample. Keeping both would need sub-second timestamps, and the row
+                    // key is seconds.
                     val ts = anchor(ev.value.ringTimestamp) ?: continue
-                    out.spo2.add(Spo2Sample(ts = ts, red = ev.value.value, ir = 0, unit = ev.value.unit))
+                    val sampleTs = ts - maxOf(0, ev.value.count - 1 - ev.value.index)
+                    out.spo2.add(Spo2Sample(ts = sampleTs, red = ev.value.value, ir = 0, unit = ev.value.unit))
                 }
 
                 is OuraEvent.Temp -> {
