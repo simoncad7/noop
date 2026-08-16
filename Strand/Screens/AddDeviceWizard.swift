@@ -39,6 +39,7 @@ struct AddDeviceWizard: View {
         case miBand        // Xiaomi Mi Band (Huami; no-auth live HR path, honest message if auth needed)
         case garmin        // Garmin watch (standard Broadcast HR path + an enable hint)
         case oura          // Oura ring (factory-reset-and-adopt: NOOP installs its own key, becomes owner)
+        case smartBand10   // Xiaomi Smart Band 10 (SPPv2 auth + realtime HR + full activity sync)
         var id: Self { self }
 
         var isWhoop: Bool { self == .whoop4 || self == .whoop5mg }
@@ -53,8 +54,8 @@ struct AddDeviceWizard: View {
         /// True for the EXPERIMENTAL tier (shown under a clearly-labelled "Experimental" heading).
         var isExperimental: Bool {
             switch self {
-            case .amazfit, .miBand, .garmin, .oura: return true
-            default:                                return false
+            case .amazfit, .miBand, .garmin, .oura, .smartBand10: return true
+            default:                                              return false
             }
         }
 
@@ -63,11 +64,12 @@ struct AddDeviceWizard: View {
         /// facts (stored brand string, `sourceKind`, id prefix) so those are no longer hardcoded per branch.
         var experimentalBrand: ExperimentalBrand? {
             switch self {
-            case .amazfit: return .amazfit
-            case .miBand:  return .miBand
-            case .garmin:  return .garmin
-            case .oura:    return .oura
-            default:       return nil
+            case .amazfit:    return .amazfit
+            case .miBand:     return .miBand
+            case .garmin:     return .garmin
+            case .oura:       return .oura
+            case .smartBand10: return .smartBand10
+            default:          return nil
             }
         }
     }
@@ -107,6 +109,8 @@ struct AddDeviceWizard: View {
     /// (best-effort from the advertised name; the user confirms by picking). The `gen` here defaults to
     /// `.gen3` when the scan couldn't guess one, so the registered command set is always usable.
     @State private var pickedOura: (ring: OuraLiveSource.DiscoveredRing, gen: OuraRingGen)?
+    /// An EXPERIMENTAL Xiaomi Smart Band 10 picked from the SmartBand10Source scan.
+    @State private var pickedSB10: SmartBand10Source.DiscoveredDevice?
 
     @State private var nameDraft = ""
     /// After registering, ask whether to make the new device active.
@@ -122,6 +126,9 @@ struct AddDeviceWizard: View {
     @State private var ouraAdvancedKeyMode = false
     /// The 32-hex-character ring key typed on the Advanced path. Validated to 16 bytes before scan.
     @State private var ouraKeyDraft = ""
+    /// The 32-hex-character Xiaomi bind token for the Smart Band 10, typed on the prep step. Validated to
+    /// 16 bytes (== `SmartBand10KeyStore.keyLength`) before scan; stored on registration.
+    @State private var sb10KeyDraft = ""
 
     /// Discovery-only HR source for the strap path. Never persists (no-op closure) and is never asked
     /// to `connect` — we only read its `@Published discovered` / `scanning` while scanning. Built once.
@@ -137,6 +144,10 @@ struct AddDeviceWizard: View {
     /// its `@Published discovered` / `scanning` / `needsPairing` while scanning. The chosen ring is adopted
     /// for real on `finishAdd`, where the registered `PairedDevice` carries the ring generation. Built once.
     @StateObject private var ouraScanner: OuraLiveSource
+    /// Discovery-only EXPERIMENTAL Smart Band 10 scanner. `feedsLive: false`, no-op persist, no auth key
+    /// (discovery never authenticates), so the wizard only reads its `discovered` / `scanning`. The chosen
+    /// band is paired for real on `finishAdd`, where the typed bind token is stored per-device. Built once.
+    @StateObject private var sb10Scanner: SmartBand10Source
 
     /// - Parameter startAt: DEBUG-only deep-link into a specific (type, step) so a seeded simulator build
     ///   can screenshot one wizard step deterministically (e.g. the Oura onboarding gate) without tapping
@@ -172,6 +183,8 @@ struct AddDeviceWizard: View {
         _ouraScanner = StateObject(wrappedValue: OuraLiveSource(
             live: live, deviceId: "scan-preview", ringGen: .gen3, authKey: { nil },
             persist: { _ in }, log: wizardLog, feedsLive: false))
+        _sb10Scanner = StateObject(wrappedValue: SmartBand10Source(
+            live: live, deviceId: "scan-preview", persist: { _ in }, log: wizardLog, feedsLive: false))
     }
 
     var body: some View {
@@ -350,6 +363,9 @@ struct AddDeviceWizard: View {
             typeRow(.garmin, icon: "applewatch",
                     title: String(localized: "Garmin watch"),
                     subtitle: String(localized: "Uses the watch's Broadcast Heart Rate. We'll show you how."))
+            typeRow(.smartBand10, icon: "waveform.path.ecg.rectangle.fill",
+                    title: "Xiaomi Smart Band 10",
+                    subtitle: String(localized: "Live heart rate + full sleep/HRV/steps sync with your Xiaomi token. Help us test."))
 
             whoopFirstNote
         }
@@ -446,6 +462,10 @@ struct AddDeviceWizard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .frostedCardSurface(cornerRadius: 14)
 
+                if type == .smartBand10 {
+                    sb10BindTokenField
+                }
+
                 Button {
                     startScan(for: type)
                     step = .pick
@@ -457,8 +477,53 @@ struct AddDeviceWizard: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(StrandPalette.accent)
+                .disabled(type == .smartBand10 && sb10KeyBytes == nil)
                 .accessibilityLabel("Scan for \(typeTitle(type))")
             }
+        }
+    }
+
+    /// The Smart Band 10 bind-token field. The band refuses every health command until it has
+    /// authenticated with the 32-hex Xiaomi bind token (from the Xiaomi cloud / Mi Fitness account), so
+    /// the prep step asks for it BEFORE scanning — the same honest gate the Oura Advanced-key path uses.
+    @ViewBuilder private var sb10BindTokenField: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "key.horizontal")
+                    .foregroundStyle(StrandPalette.statusWarning)
+                    .accessibilityHidden(true)
+                Text("The Smart Band 10 needs the 32-hex bind token from your Xiaomi account before it will share any health data. If you already have it (from Mi Fitness' hidden developer menu, or a previous setup), paste it below. NOOP cannot extract it for you. Live heart rate, sleep, HRV and steps all need this key.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.statusWarning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(StrandPalette.statusWarning.opacity(0.10),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text("Bind token (32 hex characters)").strandOverline()
+            TextField("0123456789abcdef0123456789abcdef", text: $sb10KeyDraft)
+                .textFieldStyle(.plain)
+                .font(StrandFont.body.monospaced())
+                .foregroundStyle(StrandPalette.textPrimary)
+                .autocorrectionDisabled(true)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+                .padding(12)
+                .background(StrandPalette.surfaceInset,
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .accessibilityLabel("Smart Band 10 bind token, 32 hexadecimal characters")
+            if !sb10KeyDraft.isEmpty && sb10KeyBytes == nil {
+                Text("That is not a 32-character hex token.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.statusCritical)
+            }
+            Text("NOOP stores this token only on this device, in the same secure place it stores your paired bands.")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -512,6 +577,13 @@ struct AddDeviceWizard: View {
                 String(localized: "Keep the ring on the charger or on your finger so it stays awake."),
                 String(localized: "Make sure the Oura app is fully closed. A ring answers one owner at a time."),
                 String(localized: "When the ring is reset and waking, tap Scan below."),
+            ]
+        case .smartBand10:
+            return [
+                String(localized: "Make sure your Smart Band 10 is charged, on your wrist, and NOT connected to the Mi Fitness app right now."),
+                String(localized: "Have your 32-hex Xiaomi bind token ready. Get it from the Mi Fitness app's developer settings (or log in to your Xiaomi account in NOOP once). NOOP does not extract it for you."),
+                String(localized: "Paste the token below. Without it the band refuses every health command, so Scan is disabled until it's a valid 32-hex token."),
+                String(localized: "NOOP syncs live heart rate, and your sleep, HRV and steps from the band. It never reads Xiaomi's own scores."),
             ]
         }
     }
@@ -1025,6 +1097,23 @@ struct AddDeviceWizard: View {
         return Data(bytes)
     }
 
+    /// The Smart Band 10 bind-token field parsed into 16 raw bytes, or nil when it is not exactly
+    /// 32 hex characters. Gates the Scan button (we never scan to pair a band we can't yet auth).
+    private var sb10KeyBytes: Data? {
+        let hex = sb10KeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard hex.count == SmartBand10KeyStore.keyLength * 2 else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(SmartBand10KeyStore.keyLength)
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            let next = hex.index(idx, offsetBy: 2)
+            guard let b = UInt8(hex[idx..<next], radix: 16) else { return nil }
+            bytes.append(b)
+            idx = next
+        }
+        return Data(bytes)
+    }
+
     /// SF Symbol for a device type — used on the prep step header.
     private func typeIcon(_ t: DeviceType) -> String {
         switch t {
@@ -1035,6 +1124,7 @@ struct AddDeviceWizard: View {
         case .miBand:            return "waveform.path.ecg"
         case .garmin:            return "applewatch"
         case .oura:              return "circle.circle"
+        case .smartBand10:       return "waveform.path.ecg.rectangle.fill"
         }
     }
 
@@ -1077,6 +1167,17 @@ struct AddDeviceWizard: View {
                 } onRescan: {
                     huamiScanner.scan()
                 }
+            } else if type == .smartBand10 {
+                // EXPERIMENTAL Smart Band 10 pick list (the band advertises a Xiaomi/Band/Smart name).
+                SmartBand10PickList(scanner: sb10Scanner) { dev in
+                    pickedSB10 = dev
+                    clearOtherPicks(except: type)
+                    nameDraft = dev.name
+                    sb10Scanner.stopScan()
+                    step = .confirm
+                } onRescan: {
+                    sb10Scanner.scan()
+                }
             } else {
                 // Heart-rate strap AND Garmin (Broadcast HR is the standard 0x180D path).
                 HRPickList(scanner: hrScanner) { strap in
@@ -1097,11 +1198,12 @@ struct AddDeviceWizard: View {
     private func clearOtherPicks(except keep: DeviceType) {
         if keep.isWhoop == false { pickedWhoop = nil }
         switch keep {
-        case .hrStrap, .garmin:    pickedHuami = nil; pickedMachine = nil; pickedOura = nil
-        case .gymEquipment:        pickedStrap = nil; pickedHuami = nil; pickedOura = nil
-        case .amazfit, .miBand:    pickedStrap = nil; pickedMachine = nil; pickedOura = nil
-        case .oura:                pickedStrap = nil; pickedMachine = nil; pickedHuami = nil
-        default:                   pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedOura = nil
+        case .hrStrap, .garmin:    pickedHuami = nil; pickedMachine = nil; pickedOura = nil; pickedSB10 = nil
+        case .gymEquipment:        pickedStrap = nil; pickedHuami = nil; pickedOura = nil; pickedSB10 = nil
+        case .amazfit, .miBand:    pickedStrap = nil; pickedMachine = nil; pickedOura = nil; pickedSB10 = nil
+        case .oura:                pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedSB10 = nil
+        case .smartBand10:         pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedOura = nil
+        default:                   pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedOura = nil; pickedSB10 = nil
         }
     }
 
@@ -1154,6 +1256,7 @@ struct AddDeviceWizard: View {
         if let pickedMachine { return pickedMachine.name }
         if let pickedHuami { return pickedHuami.name }
         if let pickedOura { return pickedOura.ring.name }
+        if let pickedSB10 { return pickedSB10.name }
         return type.map(typeTitle) ?? String(localized: "Device")
     }
     private var confirmBrand: String {
@@ -1169,7 +1272,7 @@ struct AddDeviceWizard: View {
         return String(localized: "Heart-rate strap")
     }
     private var confirmRSSI: Int {
-        pickedWhoop?.rssi ?? pickedStrap?.rssi ?? pickedMachine?.rssi ?? pickedHuami?.rssi ?? pickedOura?.ring.rssi ?? -70
+        pickedWhoop?.rssi ?? pickedStrap?.rssi ?? pickedMachine?.rssi ?? pickedHuami?.rssi ?? pickedOura?.ring.rssi ?? pickedSB10?.rssi ?? -70
     }
 
     // MARK: Actions
@@ -1187,7 +1290,7 @@ struct AddDeviceWizard: View {
         case .confirm:
             // Re-enter the pick step and restart its scan so the user can choose a different device.
             if let type { startScan(for: type) }
-            pickedWhoop = nil; pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedOura = nil
+            pickedWhoop = nil; pickedStrap = nil; pickedMachine = nil; pickedHuami = nil; pickedOura = nil; pickedSB10 = nil
             step = .pick
         }
     }
@@ -1230,6 +1333,7 @@ struct AddDeviceWizard: View {
         case .gymEquipment:      ftmsScanner.scan()
         case .amazfit, .miBand:  huamiScanner.scan()
         case .oura:              ouraScanner.scan()
+        case .smartBand10:       sb10Scanner.scan()
         // Heart-rate strap AND Garmin both use the standard 0x180D scanner (Garmin Broadcast HR).
         case .hrStrap, .garmin:  hrScanner.scan()
         }
@@ -1241,6 +1345,7 @@ struct AddDeviceWizard: View {
         ftmsScanner.stopScan()
         huamiScanner.stopScan()
         ouraScanner.stop()
+        sb10Scanner.stop()
     }
 
     /// Build the right `PairedDevice` for the chosen path, register it, optionally activate, then close.
@@ -1293,6 +1398,24 @@ struct AddDeviceWizard: View {
                 peripheralId: pickedHuami.id.uuidString,
                 sourceKind: brand.sourceKind,
                 capabilities: [.hr],
+                status: .paired,
+                addedAt: now, lastSeenAt: now)
+        } else if let pickedSB10, let type, let brand = type.experimentalBrand {
+            // EXPERIMENTAL Xiaomi Smart Band 10. Brand string, id prefix, and the `.smartBand10` routing
+            // all come from the catalog via the type→brand bridge. HR + HRV + sleep + steps (the band's
+            // provided data; HRV is NOOP-computed from the night's R-R on sync). Stores the user's 32-hex
+            // bind token per-device FIRST — the live source reads it back via `SmartBand10KeyStore`.
+            guard let key = sb10KeyBytes, SmartBand10KeyStore.save(key, deviceId: "\(brand.idPrefix)-\(pickedSB10.id.uuidString)") else {
+                onClose(); return
+            }
+            device = PairedDevice(
+                id: "\(brand.idPrefix)-\(pickedSB10.id.uuidString)",
+                brand: brand.displayBrand,
+                model: pickedSB10.name,
+                nickname: name == pickedSB10.name ? nil : name,
+                peripheralId: pickedSB10.id.uuidString,
+                sourceKind: brand.sourceKind,
+                capabilities: [.hr, .hrv, .sleep, .steps],
                 status: .paired,
                 addedAt: now, lastSeenAt: now)
         } else if let pickedMachine {
@@ -1400,6 +1523,7 @@ struct AddDeviceWizard: View {
         case .miBand:       return "Xiaomi Mi Band"
         case .garmin:       return String(localized: "Garmin watch")
         case .oura:         return String(localized: "Oura ring")
+        case .smartBand10:  return "Xiaomi Smart Band 10"
         }
     }
 
@@ -1583,6 +1707,36 @@ private struct HuamiPickList: View {
             } else {
                 ForEach(scanner.discovered.sorted { $0.rssi > $1.rssi }) { dev in
                     DiscoveredRow(name: dev.name, subtitle: String(localized: "Experimental"), rssi: dev.rssi) {
+                        onSelect(dev)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The EXPERIMENTAL Smart Band 10 pick step. Observes the discovery-only `SmartBand10Source` and lists
+/// found bands as real `DiscoveredRow`s (like `HuamiPickList`). The bind token was already validated on
+/// the prep step; selecting a band proceeds to confirm, where it is stored per-device and paired.
+private struct SmartBand10PickList: View {
+    @ObservedObject var scanner: SmartBand10Source
+    let onSelect: (SmartBand10Source.DiscoveredDevice) -> Void
+    let onRescan: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+            ScanStatusBar(searching: scanner.scanning, onRescan: onRescan)
+            if scanner.discovered.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    SearchingCard()
+                    Text("Not showing up? Wake the band and make sure it isn't connected to the Mi Fitness app, then tap Rescan.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                ForEach(scanner.discovered.sorted { $0.rssi > $1.rssi }) { dev in
+                    DiscoveredRow(name: dev.name, subtitle: String(localized: "Experimental · Smart Band 10"), rssi: dev.rssi) {
                         onSelect(dev)
                     }
                 }
