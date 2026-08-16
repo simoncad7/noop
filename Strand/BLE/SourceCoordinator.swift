@@ -285,10 +285,11 @@ final class SourceCoordinator: ObservableObject {
     /// connecting — the caller (`switchToStrap`) does the connect-by-identifier-else-scan bring-up.
     private func makeSource(for id: String) -> any LiveHRSource {
         switch sourceKind(for: id) {
-        case .ftms:  return makeFTMSSource(id: id)
-        case .huami: return makeHuamiSource(id: id)
-        case .oura:  return makeOuraSource(id: id)
-        default:     return makeStandardSource(id: id)
+        case .ftms:         return makeFTMSSource(id: id)
+        case .huami:        return makeHuamiSource(id: id)
+        case .oura:         return makeOuraSource(id: id)
+        case .smartBand10:  return makeSmartBand10Source(id: id)
+        default:            return makeStandardSource(id: id)
         }
     }
 
@@ -331,6 +332,35 @@ final class SourceCoordinator: ObservableObject {
             },
             log: straplog,
             onBattery: { [live] pct in live.setBattery(Double(pct)) })
+    }
+
+    /// Build the EXPERIMENTAL Smart Band 10 source for `id`. Live HR rides the SAME `LiveState` channel
+    /// (the existing live UI + recorder handle it), and the full activity sync — sleep + hypnogram + HRV
+    /// (computed from the night's R-R, never read off the band) + SpO2 + steps + daily rollups — lands in
+    /// the WhoopStore tables via `SmartBand10Importer` under this device's own id, so a synced night reads
+    /// like any imported night. The 32-hex Xiaomi bind token comes from the Keychain (`SmartBand10KeyStore`);
+    /// missing/wrong token → the source's HONEST `needsPairing`, never a fake reading.
+    private func makeSmartBand10Source(id: String) -> any LiveHRSource {
+        SmartBand10Source(
+            live: live,
+            deviceId: id,
+            persist: { [storeHandle] streams in
+                Task { if let store = await storeHandle() { _ = try? await store.insert(streams, deviceId: id) } }
+            },
+            persistFiles: { [storeHandle, straplog] files in
+                Task {
+                    guard let store = await storeHandle() else { return }
+                    do {
+                        let changed = try await SmartBand10Importer.ingest(files, into: store, deviceId: id)
+                        straplog("Smart Band 10: importer upserted \(changed) row(s) from \(files.count) file(s)")
+                    } catch {
+                        straplog("Smart Band 10: importer failed - \(error.localizedDescription)")
+                    }
+                }
+            },
+            log: straplog,
+            onBattery: { [live] pct in live.setBattery(Double(pct)) },
+            authKey: { SmartBand10KeyStore.read(deviceId: id) })
     }
 
     /// One duplicate-candidate's shape for the `dup-gen(#1284)` line: the window, its duration, and the two
