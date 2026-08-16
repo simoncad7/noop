@@ -116,6 +116,13 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     private var fileIdsContinuation: CheckedContinuation<[ActivityFileId]?, Never>?
     private var fileContinuation: CheckedContinuation<ParsedActivityFile?, Never>?
     private var syncIsRunning = false
+    /// Periodic activity re-sync while connected, so a session left open overnight (or after a nap) picks
+    /// up freshly-banked sleep / R-R / HR / steps on the band's flash WITHOUT needing a reconnect. Mirrors
+    /// Oura's 900 s history re-fetch and BLEManager's ~15 min WHOOP history-offload floor — the same
+    /// cadence the base app uses for its own pull-based devices. `syncActivity()` is guarded by
+    /// `syncIsRunning` + `isAuthenticated`, so a fire that overlaps an in-flight sync is a no-op.
+    private var syncTimer: Timer?
+    private let syncInterval: TimeInterval = 900
 
     // MARK: - Init
 
@@ -269,6 +276,10 @@ public final class SmartBand10Source: NSObject, ObservableObject {
             return try session.postAuthInit()
         }
         startRealtimeLoop()
+        // Re-arm the periodic activity re-sync (the same 900 s cadence Oura / the WHOOP offload use) so a
+        // connection left open keeps pulling freshly-banked band data; the timer's first fire is minutes
+        // after the initial sync below, and syncActivity's own guards make any overlap a no-op.
+        startSyncTimer()
         // After the band settles (a few seconds past auth + init), pull the full activity channel once.
         // The sync stops/restarts the realtime poll itself, so it is safe to overlap the initial start.
         Task { @MainActor [weak self] in
@@ -351,6 +362,19 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     }
 
     // MARK: - Activity sync (channel 5: sleep / HRV / R-R / SpO2 / steps / daily rollups)
+
+    private func startSyncTimer() {
+        stopSyncTimer()
+        let t = Timer.scheduledTimer(withTimeInterval: syncInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.syncActivity() }
+        }
+        syncTimer = t
+    }
+
+    private func stopSyncTimer() {
+        syncTimer?.invalidate()
+        syncTimer = nil
+    }
 
     /// Pull the band's full activity channel: today + past file lists, then each file (reassembled +
     /// parsed by the protocol package), then hand the parsed files to `persistFiles` (the importer).
@@ -575,6 +599,7 @@ public final class SmartBand10Source: NSObject, ObservableObject {
         realtimeTask?.cancel(); realtimeTask = nil
         syncTimeoutTask?.cancel(); syncTimeoutTask = nil
         connectTimeoutTask?.cancel(); connectTimeoutTask = nil
+        stopSyncTimer()
     }
 
     /// Resume any in-flight sync wait with `nil` so a disconnect mid-sync doesn't leave `syncActivity()`
