@@ -40,6 +40,7 @@ jobs:
           - WhoopProtocol
           - OuraProtocol
           - PolarProtocol
+          - SmartBand10Protocol
           - WhoopStore
           - StrandAnalytics
           - StrandImport
