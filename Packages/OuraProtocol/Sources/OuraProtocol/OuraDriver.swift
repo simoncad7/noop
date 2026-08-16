@@ -439,6 +439,20 @@ public final class OuraDriver {
             // the movement-correlated fields present in both).
             guard let fields = OuraDecoders.decodeRealStepsFields(record) else { return [] }
             return [.realStepsFields(fields)]
+        case .sleepPeriodInfo:
+            // Split out of the raw-bytes .tierB wrapper, same as .activityInfo: this tag has a cited
+            // third-party layout ([open_ring]) whose field NAMES are what our own §6.12 was missing, and
+            // whose declared invariants our captures uphold. Still Tier B - only reached behind
+            // allowTierB (gated above). ONE field of it is durable: OuraStreamMapping maps `breathsPerMin`
+            // to a respSample row under the ring's OWN deviceId, shown on the respiration track. It is NOT
+            // scored: `dailyMetric.respRateBpm` is untouched (it stays the RSA estimate), and
+            // `OuraRespScale.forScoring` refuses the ring's rows at EVERY scoring read — staging included,
+            // because that path reads the stream as a ~1 Hz raw ADC waveform and a per-window rate is the
+            // wrong shape for a peak detector. `averageHrBpm` and every other field
+            // stay diagnostic-only - in particular the HR must not join the beat-derived series at a
+            // different cadence.
+            guard let info = OuraDecoders.decodeSleepPeriodInfo(record) else { return [] }
+            return [.sleepPeriodInfo(info)]
         case .spo2Smoothed:
             return [.tierB(OuraTierBSummary(tag: record.type, ringTimestamp: record.ringTimestamp,
                                             rawPayload: record.payload, kind: "spo2_smoothed"))]

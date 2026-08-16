@@ -518,6 +518,21 @@ class OuraDriver(
                 val fields = OuraDecoders.decodeRealStepsFields(record) ?: return emptyList()
                 listOf(OuraEvent.RealStepsFields(fields))
             }
+            OuraEventTag.SLEEP_PERIOD_INFO -> {
+                // Split out of the raw-bytes TierB wrapper, same as ActivityInfo: this tag has a cited
+                // third-party layout ([open_ring]) whose field NAMES are what our own s6.12 was missing,
+                // and whose declared invariants our captures uphold. Still Tier B - only reached behind
+                // allowTierB (gated above). ONE field of it is durable: OuraStreamMapping maps
+                // `breathsPerMin` to a respSample row under the ring's OWN deviceId, shown on the
+                // respiration track. It is NOT scored: dailyMetric.respRateBpm is untouched (it stays the
+                // RSA estimate), and OuraRespScale.forScoring refuses the ring's rows at EVERY scoring read
+                // - staging included, because that path reads the stream as a ~1 Hz raw ADC waveform and a
+                // per-window rate is the wrong shape for a peak detector. `averageHrBpm`
+                // and every other field stay diagnostic-only - in particular the HR must not join the
+                // beat-derived series at a different cadence.
+                val info = OuraDecoders.decodeSleepPeriodInfo(record) ?: return emptyList()
+                listOf(OuraEvent.SleepPeriodInfo(info))
+            }
             OuraEventTag.SPO2_SMOOTHED ->
                 listOf(
                     OuraEvent.TierB(
