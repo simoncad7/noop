@@ -72,6 +72,15 @@ public enum SourceKind: String, Sendable, CaseIterable {
     /// wins ownership only when nothing else has data (a genuinely strap-less day), where its measured HR
     /// lights the day Effort. Additive (no DB migration): only the activity-file importer writes it.
     case activityFile
+    /// An EXPERIMENTAL live Xiaomi Smart Band 10 source over the band's own clean-room SPPv2 BLE protocol
+    /// (`SmartBand10Protocol` package: FE95 service, EC/CRC auth, realtime subtype-45→47 HR, activity
+    /// channel 5). Owns its OWN central/GATT, never the WHOOP path. Requires the band's Xiaomi cloud bind
+    /// token (the 32-hex auth key), entered directly or fetched once via the optional Xiaomi account login
+    /// (both on-device, never phone home). Streams live HR into the existing stream tables AND syncs the
+    /// band's full activity channel — sleep (with hypnogram), HRV from the R-R stream, SpO2, steps and the
+    /// daily rollups — into the dailyMetric / sleepSession / metricSeries tables via `SmartBand10Importer`.
+    /// Additive (no DB migration): only the experimental add-device wizard's Smart Band 10 path writes it.
+    case smartBand10
 }
 
 /// Canonical metric a source can provide. Drives capability-aware UI + the day-owner resolver.

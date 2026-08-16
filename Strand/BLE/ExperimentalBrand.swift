@@ -22,6 +22,10 @@ public enum ExperimentalBrand: String, CaseIterable, Sendable, Equatable {
     /// Oura ring. No open live health stream — proprietary, syncs to Oura's own app. The driver makes
     /// the detection attempt and then points honestly at file import.
     case oura
+    /// Xiaomi Smart Band 10. Runs the band's OWN SPPv2 BLE protocol (SmartBand10Protocol): EC/CRC auth
+    /// with the user's 32-hex Xiaomi bind token, live HR via the realtime channel, and a full sync of
+    /// the activity channel (sleep + HRV/R-R + SpO2 + steps + daily rollups) into the WhoopStore tables.
+    case smartBand10
 
     /// Best-effort brand from an advertised name. Returns `nil` for an unrecognised name, OR for a name the
     /// catalog recognises as a NON-experimental generic strap (Polar / Wahoo / …) — `ExperimentalBrand`
@@ -38,10 +42,11 @@ public enum ExperimentalBrand: String, CaseIterable, Sendable, Equatable {
     /// test pins that).
     public var displayBrand: String {
         switch self {
-        case .amazfit: return "Amazfit"
-        case .miBand:  return "Mi Band"
-        case .garmin:  return "Garmin"
-        case .oura:    return "Oura"
+        case .amazfit:    return "Amazfit"
+        case .miBand:     return "Mi Band"
+        case .garmin:     return "Garmin"
+        case .oura:       return "Oura"
+        case .smartBand10: return "Smart Band 10"
         }
     }
 
@@ -69,11 +74,12 @@ public enum ExperimentalBrand: String, CaseIterable, Sendable, Equatable {
     /// Map a catalog brand string back to the typed case (nil for a non-experimental brand).
     private init?(displayBrand brand: String) {
         switch brand {
-        case "Amazfit": self = .amazfit
-        case "Mi Band": self = .miBand
-        case "Garmin":  self = .garmin
-        case "Oura":    self = .oura
-        default:        return nil
+        case "Amazfit":     self = .amazfit
+        case "Mi Band":     self = .miBand
+        case "Garmin":      self = .garmin
+        case "Oura":        self = .oura
+        case "Smart Band 10": self = .smartBand10
+        default:            return nil
         }
     }
 }
