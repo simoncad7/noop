@@ -27,6 +27,18 @@ NOOP builds on prior community reverse-engineering and interoperability work:
   about the live Mi-protobuf BLE stack in the roadmap's research notes. GPLv3; NOOP copies
   **none** of its code and has not built the live lane.
 
+## Xiaomi Smart Band 10 live BLE protocol
+- **`xiaomi_band`** (Python reference scripts) and **Gadgetbridge** — the protocol facts behind
+  NOOP's new `SmartBand10Protocol` package: SPPv2 framing (`A5 A5` header, CRC-16/ARC, session/auth
+  packet shapes), the EC/CRC auth handshake (HKDF key derivation, AES-CCM step-3, persistent AES-CTR
+  session keys), the realtime subtype-45→47 heart-rate flow, and the health/activity file formats
+  (daily summary/details, sleep summary with the `0x08` R-R stream). The package is a **re-derived,
+  pure-Swift** implementation of those facts — written from the documented protocol and validated
+  byte-for-byte against captured real-device fixtures; no GPL/AGPL code is copied. The band's
+  binding **auth key** (32 hex) is the Xiaomi cloud device bind token: entered by the user directly,
+  or fetched once through the optional Xiaomi account login (both are opt-in, on-device, and never
+  phone home to NOOP).
+
 ## Facts learned from a decompiled app
 
 The facts-only doctrine above is usually applied to other open-source RE projects. It applies the same
