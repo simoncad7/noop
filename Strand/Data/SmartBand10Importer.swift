@@ -1,14 +1,16 @@
 import Foundation
 import WhoopStore
+import WhoopProtocol
 import SmartBand10Protocol
 
 /// Maps the parsed Smart Band 10 activity channel (the `[ParsedActivityFile]` the live source's
 /// `persistFiles` closure hands over) into the SAME WhoopStore tables the UI reads — `dailyMetric`,
-/// `sleepSession` (with the band's real per-epoch hypnogram), and the generic `metricSeries` — under
-/// the registered device's OWN id (`deviceId` partition), so a synced night lights up History exactly
-/// like a WHOOP or imported night. WHOOP-FIRST: this is the band's PROVIDED data, not a NOOP-computed
-/// derivation; NOOP never reads a Xiaomi score (the Mi Fitness app's readiness/stress scores never
-/// leave the phone, and only the raw channel is pulled).
+/// `sleepSession` (with the band's real per-epoch hypnogram), the generic `metricSeries`, and the
+/// per-minute `hrSample` / `rrInterval` streams — under the registered device's OWN id (`deviceId`
+/// partition), so a synced night lights up History exactly like a WHOOP or imported night.
+/// WHOOP-FIRST: this is the band's PROVIDED data, not a NOOP-computed derivation; NOOP never reads a
+/// Xiaomi score (the Mi Fitness app's readiness/stress scores never leave the phone, and only the raw
+/// channel is pulled).
 ///
 /// HRV is the ONE thing computed here (not read off the band): `HrvCalculator` derives SDNN / RMSSD
 /// from the sleep file's R-R beat stream (`heartPulses`) gated to deep+light stages — the same
@@ -25,6 +27,16 @@ enum SmartBand10Importer {
     static func ingest(_ files: [ParsedActivityFile], into store: WhoopStore,
                        deviceId: String) async throws -> Int {
         var changes = 0
+
+        // The night's HRV (NOOP-computed from the 0x08 R-R stream), keyed by the day the night ENDED —
+        // shared by the daily row's avgHrv/avgSdnn and the metricSeries hrv_* keys below.
+        var hrvByDay: [String: HrvMetrics] = [:]
+        for s in files.compactMap(\.sleepSession) {
+            if let hrv = Self.hrv(for: s) {
+                let key = Self.dayKey(timestamp: Int(s.wakeupTime))
+                if hrvByDay[key] == nil { hrvByDay[key] = hrv }   // first night on a day wins
+            }
+        }
 
         // 1. Daily rollups ← ACTIVITY_DAILY summary + the sleep totals of any night on that day.
         var daily: [DailyMetric] = []
@@ -49,7 +61,7 @@ enum SmartBand10Importer {
                 lightMin: light > 0 ? light : nil,
                 disturbances: nil,
                 restingHr: summary.heartRateResting.map(Int.init),
-                avgHrv: nil,        // set from the sleep file's R-R below, when the same day has one
+                avgHrv: hrvByDay[day]?.rmssdMs,
                 recovery: nil,
                 strain: nil,
                 exerciseCount: nil,
@@ -57,7 +69,8 @@ enum SmartBand10Importer {
                 skinTempDevC: nil,
                 respRateBpm: nil,
                 steps: summary.steps.map(Int.init),
-                activeKcalEst: summary.calories.map(Double.init)))
+                activeKcalEst: summary.calories.map(Double.init),
+                avgSdnn: hrvByDay[day]?.sdnnMs))
         }
         changes += try await store.upsertDailyMetrics(daily, deviceId: deviceId)
 
@@ -90,11 +103,18 @@ enum SmartBand10Importer {
             add(day, "stress", summary.stressAvg.map(Double.init))
             add(day, "stress_max", summary.stressMax.map(Double.init))
             add(day, "energy_kcal", summary.calories.map(Double.init))
+            add(day, "active_calories", summary.activeCalories.map(Double.init))
             add(day, "training_load_day", summary.trainingLoadDay.map(Double.init))
+            add(day, "training_load_week", summary.trainingLoadWeek.map(Double.init))
+            add(day, "training_load_level", summary.trainingLoadLevel.map(Double.init))
+            add(day, "recovery_hours", summary.recoveryHours.map(Double.init))
+            add(day, "stress_min", summary.stressMin.map(Double.init))
+            add(day, "standing_min", summary.standing.map(Double.init))
+            add(day, "vitality_light", summary.vitalityLight.map(Double.init))
+            add(day, "vitality_moderate", summary.vitalityModerate.map(Double.init))
+            add(day, "vitality_high", summary.vitalityHigh.map(Double.init))
             // The night's HRV lands on the day the night ENDED (the morning it's measured for).
-            if let s = files.compactMap(\.sleepSession).first(where: {
-                Self.dayKey(timestamp: Int($0.wakeupTime)) == day
-            }), let hrv = Self.hrv(for: s) {
+            if let hrv = hrvByDay[day] {
                 add(day, "hrv_sdnn", hrv.sdnnMs)
                 add(day, "hrv_rmssd", hrv.rmssdMs)
             }
@@ -104,6 +124,50 @@ enum SmartBand10Importer {
                 Double(m.value))
         }
         changes += try await store.upsertMetricSeries(points, deviceId: deviceId)
+
+        // 4. Per-minute STREAM rows (hrSample / rrInterval) — the raw beat-level record the Deep Timeline,
+        // Stress, and HRV read paths consume, under the device's own id. Idempotent: store.insert is
+        // ON CONFLICT-DO-NOTHING on (deviceId, ts), so re-syncing the same files never duplicates.
+        //
+        // Only HR + R-R are representable here: the band's SpO2 % and per-minute step COUNTS do not fit
+        // the store's raw-ADC spo2Sample / cumulative-counter stepSample shapes, so they stay at the
+        // daily/rollup level (steps, spo2Pct, the metricSeries keys above) rather than corrupting a
+        // stream with semantically different numbers.
+        var streams = Streams()
+
+        // Night: minute-resolution HR + beat-to-beat R-R from the sleep-details file (0x08).
+        for s in files.compactMap(\.sleepSession) {
+            if let series = s.heartRateSeries, let first = series.firstRecordTime,
+               !series.samples.isEmpty {
+                for (i, bpm) in series.samples.enumerated() {
+                    streams.hr.append(HRSample(ts: Int(first) + i * 60, bpm: Int(bpm)))
+                }
+            }
+            // R-R: absolute beat timestamps (epoch ms) → consecutive deltas, stamped at the beat that
+            // completes each interval. A jump > 30 s is a recording gap, not a beat — skipped exactly
+            // like HrvCalculator, so the raw stream never banks a fake beat across a gap.
+            if let pulses = s.heartPulses, pulses.count >= 2 {
+                for i in 0..<(pulses.count - 1) {
+                    let rrMs = Int(pulses[i + 1] - pulses[i])
+                    guard rrMs <= 30_000 else { continue }
+                    streams.rr.append(RRInterval(ts: Int(pulses[i + 1] / 1000), rrMs: rrMs))
+                }
+            }
+        }
+
+        // Day: minute-resolution HR from the daily-details file (ACTIVITY_DAILY detail 0).
+        for d in files.compactMap(\.dailyDetails) {
+            for sample in d.samples {
+                if let bpm = sample.heartRate {
+                    streams.hr.append(HRSample(ts: Int(sample.timestamp), bpm: Int(bpm)))
+                }
+            }
+        }
+
+        if !streams.hr.isEmpty || !streams.rr.isEmpty {
+            let inserted = try await store.insert(streams, deviceId: deviceId)
+            changes += inserted.hr + inserted.rr
+        }
 
         return changes
     }
