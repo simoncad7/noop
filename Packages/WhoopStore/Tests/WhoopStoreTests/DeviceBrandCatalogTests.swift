@@ -10,6 +10,8 @@ final class DeviceBrandCatalogTests: XCTestCase {
         let cases: [(String, String)] = [
             ("Amazfit Helio Ring", "Amazfit"),
             ("Zepp E", "Amazfit"),
+            ("Smart Band 10", "Smart Band 10"),
+            ("Xiaomi Smart Band 10", "Smart Band 10"),
             ("Mi Smart Band 8", "Mi Band"),
             ("Xiaomi Band 9", "Mi Band"),
             ("Garmin Forerunner 265", "Garmin"),
@@ -33,10 +35,13 @@ final class DeviceBrandCatalogTests: XCTestCase {
     }
 
     /// Mi Band is a Huami sub-brand: its tokens must win over the broader Amazfit family so a "Smart Band"
-    /// never mis-labels as Amazfit. Order in `all` guarantees this.
+    /// never mis-labels as Amazfit. The dedicated Smart Band 10 row is MORE specific and must win over the
+    /// broad Mi Band tokens ("smart band" / "xiaomi") for the actual device, while an older sub-band
+    /// ("Xiaomi Smart Band 8") still routes to Mi Band. Order in `all` guarantees this.
     func testMiBandWinsOverAmazfit() {
         XCTAssertEqual(DeviceBrandCatalog.spec(forAdvertisedName: "Mi Band")?.brand, "Mi Band")
-        XCTAssertEqual(DeviceBrandCatalog.spec(forAdvertisedName: "Smart Band 10")?.brand, "Mi Band")
+        XCTAssertEqual(DeviceBrandCatalog.spec(forAdvertisedName: "Smart Band 10")?.brand, "Smart Band 10")
+        XCTAssertEqual(DeviceBrandCatalog.spec(forAdvertisedName: "Xiaomi Smart Band 8")?.brand, "Mi Band")
     }
 
     func testRoutingAndTierFacts() {
@@ -50,6 +55,7 @@ final class DeviceBrandCatalogTests: XCTestCase {
         XCTAssertEqual(spec("Amazfit").sourceKind, .huami)
         XCTAssertEqual(spec("Mi Band").sourceKind, .huami)
         XCTAssertEqual(spec("Oura").sourceKind, .oura)
+        XCTAssertEqual(spec("Smart Band 10").sourceKind, .smartBand10)
         // Garmin + generic straps are standard 0x180D live-BLE (no proprietary protocol).
         XCTAssertEqual(spec("Garmin").sourceKind, .liveBLE)
         XCTAssertEqual(spec("Polar").sourceKind, .liveBLE)
@@ -58,13 +64,15 @@ final class DeviceBrandCatalogTests: XCTestCase {
         XCTAssertEqual(spec("Oura").idPrefix, "oura")
         XCTAssertEqual(spec("Garmin").idPrefix, "garmin")
         XCTAssertEqual(spec("Polar").idPrefix, "strap")
+        XCTAssertEqual(spec("Smart Band 10").idPrefix, "xiaomi-sb10")
         // Honest capability: Oura has no open live stream; everyone else here does.
         XCTAssertFalse(spec("Oura").canStreamLiveHR)
         XCTAssertTrue(spec("Amazfit").canStreamLiveHR)
         XCTAssertTrue(spec("Garmin").canStreamLiveHR)
         XCTAssertTrue(spec("Polar").canStreamLiveHR)
-        // Tier: the four experimental brands are the opt-in tier; generic straps are not.
-        for b in ["Amazfit", "Mi Band", "Garmin", "Oura"] { XCTAssertTrue(spec(b).isExperimentalTier, b) }
+        XCTAssertTrue(spec("Smart Band 10").canStreamLiveHR)
+        // Tier: the experimental brands are the opt-in tier; generic straps are not.
+        for b in ["Amazfit", "Mi Band", "Garmin", "Oura", "Smart Band 10"] { XCTAssertTrue(spec(b).isExperimentalTier, b) }
         for b in ["Polar", "Wahoo", "Coospo", "Scosche", "Magene"] { XCTAssertFalse(spec(b).isExperimentalTier, b) }
     }
 

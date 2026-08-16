@@ -45,6 +45,10 @@ public enum DeviceBrandCatalog {
     /// are otherwise disjoint across rows, so the remaining order is cosmetic.
     public static let all: [DeviceBrandSpec] = [
         // EXPERIMENTAL tier — custom-protocol or broadcast live sources, opt-in and best-effort.
+        // Smart Band 10 MUST precede Mi Band: its "smart band 10" token is more specific, so the real
+        // device routes to its own auth'd driver instead of being captured by the broad Huami row.
+        DeviceBrandSpec(brand: "Smart Band 10", nameTokens: ["smart band 10", "smartband 10"],
+                        sourceKind: .smartBand10, idPrefix: "xiaomi-sb10", canStreamLiveHR: true, isExperimentalTier: true),
         DeviceBrandSpec(brand: "Mi Band", nameTokens: ["mi band", "miband", "smart band", "xiaomi"],
                         sourceKind: .huami, idPrefix: "huami", canStreamLiveHR: true, isExperimentalTier: true),
         DeviceBrandSpec(brand: "Amazfit", nameTokens: ["amazfit", "zepp", "helio", "huami"],
