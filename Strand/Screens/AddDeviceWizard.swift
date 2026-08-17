@@ -583,7 +583,7 @@ struct AddDeviceWizard: View {
                 String(localized: "Make sure your Smart Band 10 is charged, on your wrist, and NOT connected to the Mi Fitness app right now."),
                 String(localized: "Have your 32-hex Xiaomi bind token ready. Get it from the Mi Fitness app's developer settings (or log in to your Xiaomi account in NOOP once). NOOP does not extract it for you."),
                 String(localized: "Paste the token below. Without it the band refuses every health command, so Scan is disabled until it's a valid 32-hex token."),
-                String(localized: "NOOP syncs live heart rate, and your sleep, HRV and steps from the band. It never reads Xiaomi's own scores."),
+                String(localized: "NOOP syncs live heart rate, and your sleep, HRV, SpO₂ and steps from the band. It never reads Xiaomi's own scores."),
             ]
         }
     }
@@ -1415,7 +1415,7 @@ struct AddDeviceWizard: View {
                 nickname: name == pickedSB10.name ? nil : name,
                 peripheralId: pickedSB10.id.uuidString,
                 sourceKind: brand.sourceKind,
-                capabilities: [.hr, .hrv, .sleep, .steps],
+                capabilities: [.hr, .hrv, .sleep, .steps, .spo2],
                 status: .paired,
                 addedAt: now, lastSeenAt: now)
         } else if let pickedMachine {

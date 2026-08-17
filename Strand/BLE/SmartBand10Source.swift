@@ -124,6 +124,24 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     private var syncTimer: Timer?
     private let syncInterval: TimeInterval = 900
 
+    // MARK: - Reconnect (mirrors OuraLiveSource's capped-exponential backoff)
+
+    /// Set while we're connecting / connected so an involuntary drop (band out of range, band reboot)
+    /// triggers an automatic reconnect instead of leaving the device dead until the user taps Connect.
+    /// A deliberate teardown (`stop()`, an auth-failure cancel) sets `intentionalDisconnect` to suppress it.
+    private var reconnectID: UUID?
+    private var intentionalDisconnect = false
+    /// Consecutive failed-reconnect count. Reset only on a REAL connection (`didConnect`), `stop()` and an
+    /// auth-failure cancel — never in `connect(_:)`, or the backoff would never progress past its first step.
+    private var reconnectAttempt = 0
+
+    // MARK: - Battery persistence
+
+    /// Banked battery readings, flushed into the `battery` table on the next `flush()`. Without this the
+    /// band's battery only lives in `LiveState` (in-memory samples that reset every connect) — Oura and the
+    /// WHOOP strap persist battery rows, so the band should too.
+    private var batteryBuffer: [BatterySample] = []
+
     // MARK: - Init
 
     public init(live: LiveState,
@@ -199,6 +217,10 @@ public final class SmartBand10Source: NSObject, ObservableObject {
         stopScan()
         needsPairing = nil
         makeSessionIfNeeded()
+        // A user-initiated connect arms auto-reconnect for the whole link lifetime. A deliberate teardown
+        // (`stop()`) clears this; an involuntary drop (out of range, band reboot) re-issues connect().
+        reconnectID = id
+        intentionalDisconnect = false
         // Bonded Xiaomi bands stop advertising — reconnect by the stored identifier first (memory
         // smartband10-bonded-reconnect), falling back to the scan cache / a fresh scan.
         let p = seenPeripherals[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first
@@ -221,6 +243,11 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     }
 
     public func stop() {
+        // Deliberate teardown — the reconnect backoff must NOT fire after this. Set before the peripheral
+        // cancel so the resulting didDisconnectPeripheral sees it and suppresses the reconnect.
+        intentionalDisconnect = true
+        reconnectID = nil
+        reconnectAttempt = 0
         stopScan()
         pendingConnectID = nil
         cancelTasks()
@@ -297,6 +324,16 @@ public final class SmartBand10Source: NSObject, ObservableObject {
             status = "Auth failed — wrong bind token?"
             needsPairing = "The band rejected the auth key. Double-check the 32-hex Xiaomi bind token for " +
                            "this band, or log in to your Xiaomi account again."
+            // Drop the BLE link so `session` nils out (didDisconnectPeripheral) — with the peripheral left
+            // connected, a user who corrects the key and taps Connect would hit makeSessionIfNeeded()'s
+            // early return (`session != nil`) and the stale key would never be re-read. Mirrors
+            // OuraLiveSource's cancel on adopt failure. Also suppress the reconnect backoff: this is a
+            // deliberate teardown, the link died for a reason a timer can't fix.
+            intentionalDisconnect = true
+            reconnectID = nil
+            reconnectAttempt = 0
+            pendingConnectID = nil
+            if let p = peripheral { central.cancelPeripheralConnection(p) }
             return
         }
         authRetryAttempted = true
@@ -473,6 +510,12 @@ public final class SmartBand10Source: NSObject, ObservableObject {
         case .battery(let battery):
             batteryPct = Int(battery.level)
             onBattery(Int(battery.level))
+            // Bank it into the `battery` table (BatterySample → StreamStore battery rows) so the band's
+            // charge history persists and charts across connects, like Oura's BatterySample walk.
+            batteryBuffer.append(BatterySample(ts: Int(Date().timeIntervalSince1970),
+                                               soc: Double(battery.level),
+                                               mv: nil,
+                                               charging: nil))
         case .realtime(let sample):
             if sample.heartRate > 10 {
                 zeroHrCount = 0
@@ -515,14 +558,21 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     }
 
     private func flush() {
-        guard !buffer.isEmpty else { lastFlush = Date(); return }
-        for sample in buffer {
+        if !buffer.isEmpty {
             // HR-only mapping for the live channel (the band's realtime packet has no R-R; R-R lives in
             // the sleep files and arrives via the importer). Same HR→Streams mapping the generic strap
             // path uses, so persisted rows are identical in shape and source-tagged by id.
-            persist(StandardHRMapping.samples(fromHR: sample.hr, rr: [], at: sample.ts))
+            for sample in buffer {
+                persist(StandardHRMapping.samples(fromHR: sample.hr, rr: [], at: sample.ts))
+            }
+            buffer.removeAll()
         }
-        buffer.removeAll()
+        if !batteryBuffer.isEmpty {
+            // Persist banked battery readings into the `battery` table (ON CONFLICT(deviceId, ts) DO
+            // NOTHING keeps re-reads/idempotent). The coordinator's persist closure routes it to the store.
+            persist(Streams(events: [], battery: batteryBuffer))
+            batteryBuffer.removeAll()
+        }
         lastFlush = Date()
     }
 
@@ -615,6 +665,26 @@ public final class SmartBand10Source: NSObject, ObservableObject {
             continuation.resume(returning: nil)
         }
     }
+
+    /// Re-reach the band after an involuntary drop (`didDisconnectPeripheral` with an error) or a failed
+    /// connect, unless the teardown was intentional (`stop()`, auth-failure cancel) or there is no known id.
+    ///
+    /// Mirrors `OuraLiveSource.scheduleReconnect()`: the first attempts use a short timed backoff (the app is
+    /// awake — it just received the callback — so a 3s/6s/12s retry fixes a transient blip fast), capped at
+    /// 60 s so a long outage never hot-loops. Unlike Oura we don't keep a STANDING CoreBluetooth connect
+    /// outstanding across the phone's suspension — SmartBand10Source has no state-restoration surface yet,
+    /// and the capped timer still re-arms on resume within 60 s. Every wake re-checks `intentionalDisconnect`
+    /// and that the target id is unchanged, so a deliberate teardown never races a stale reconnect.
+    private func scheduleReconnect() {
+        guard !intentionalDisconnect, let id = reconnectID else { return }
+        reconnectAttempt = min(reconnectAttempt + 1, 5)
+        let delay = min(60.0, 3.0 * pow(2.0, Double(reconnectAttempt - 1)))
+        log("Smart Band 10: reconnecting in \(Int(delay))s (attempt \(reconnectAttempt))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.intentionalDisconnect, self.reconnectID == id else { return }
+            self.connect(id)
+        }
+    }
 }
 
 // MARK: - LiveHRSource conformance
@@ -667,6 +737,8 @@ extension SmartBand10Source: @preconcurrency CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         log("Smart Band 10: connected — discovering services")
+        // A real connection clears the reconnect backoff (mirrors Oura #912) — the next drop starts fresh.
+        reconnectAttempt = 0
         status = "Connected, discovering…"
         peripheral.delegate = self
         peripheral.discoverServices(nil)
@@ -678,11 +750,14 @@ extension SmartBand10Source: @preconcurrency CBCentralManagerDelegate {
         if feedsLive { live.connected = false }
         connected = false
         status = "Connect failed"
+        // A failed connect is an involuntary miss — re-issue unless we tore down deliberately.
+        scheduleReconnect()
     }
 
     public func centralManager(_ central: CBCentralManager,
                                didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         log("Smart Band 10: disconnected\(error.map { " — \($0.localizedDescription)" } ?? " (clean)")")
+        let wasInvoluntary = error != nil
         cancelTasks()
         cancelSyncWaits()
         isAuthenticated = false
@@ -704,6 +779,10 @@ extension SmartBand10Source: @preconcurrency CBCentralManagerDelegate {
         }
         status = "Disconnected"
         if self.peripheral?.identifier == peripheral.identifier { self.peripheral = nil }
+        // An involuntary drop (band out of range, battery killed the link, remote reset) reconnects
+        // automatically; a clean disconnect — including our own cancelPeripheralConnection in stop() and
+        // the auth-failure cancel — stays down.
+        if wasInvoluntary { scheduleReconnect() }
     }
 }
 
@@ -762,6 +841,10 @@ extension SmartBand10Source: @preconcurrency CBPeripheralDelegate {
             if let data = characteristic.value, let level = data.first {
                 batteryPct = Int(level)
                 onBattery(Int(level))
+                batteryBuffer.append(BatterySample(ts: Int(Date().timeIntervalSince1970),
+                                                   soc: Double(level),
+                                                   mv: nil,
+                                                   charging: nil))
                 log("Smart Band 10: battery \(level)%")
             }
             return

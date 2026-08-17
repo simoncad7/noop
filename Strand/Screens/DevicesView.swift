@@ -1065,6 +1065,7 @@ private struct DeviceCard: View {
         if device.sourceKind == .huami { return "waveform.path.ecg.rectangle" }
         if device.sourceKind == .liveAppleWatch { return "applewatch" }
         if device.sourceKind == .oura { return "circle.circle" }
+        if device.sourceKind == .smartBand10 { return "waveform.path.ecg.rectangle.fill" }
         return SourceCoordinator.isWhoop(device) ? "applewatch.side.right" : "heart.circle"
     }
 
@@ -1199,6 +1200,18 @@ struct DeviceCapabilityProfile {
                 captures: captures.isEmpty ? String(localized: "Calibrating, no data yet") : captures,
                 powers: String(localized: "Powers Rest, Effort, Fitness Age and steps, plus Charge once recovery calibrates"),
                 footnote: String(localized: "Computed live from your Apple Watch via Health. Recovery needs about a week of nights to calibrate, and every watch-derived score is labelled with its confidence. Only the metrics your watch actually records are listed above."))
+        }
+        // EXPERIMENTAL Xiaomi Smart Band 10: full activity sync — live HR + the band's measured sleep
+        // (hypnogram, stage minutes), NOOP-computed HRV from the night's R-R, SpO₂ %, steps, daily
+        // rollups — into the same WhoopStore tables every import reads. Honest caveats: HRV is computed
+        // (never read off the band), SpO₂ syncs as a % (band-provided, not raw ADC), and Charge/Effort/
+        // Rest are NOOP-derived scores that need enough synced nights to appear.
+        if d.sourceKind == .smartBand10 {
+            return DeviceCapabilityProfile(
+                displayModel: String(localized: "\(d.brand) (experimental)"),
+                captures: String(localized: "Heart rate · HRV · Sleep · SpO₂ · Steps · Battery"),
+                powers: String(localized: "Powers the live console + Effort, driven nightly by synced sleep, HRV, SpO₂ and steps"),
+                footnote: String(localized: "Experimental. HRV is computed by NOOP from the band's R-R stream; Charge/Effort/Rest need enough synced nights. No skin temp or respiratory rate."))
         }
         // Generic heart-rate strap: live HR + R-R only; drives the live console + Effort, nothing nightly.
         // (Same WHOOP test as SourceCoordinator.isWhoop, inlined so this stays nonisolated.)

@@ -39,15 +39,19 @@ enum SmartBand10Importer {
         }
 
         // 1. Daily rollups ← ACTIVITY_DAILY summary + the sleep totals of any night on that day.
+        //    Sleep minutes may come from the RICH 0x08 file OR the stage-only 0x03 file (a night can
+        //    exist as either — see the 0x08/0x03 preference in step 2), so the rollup reads BOTH.
         var daily: [DailyMetric] = []
         for summary in files.compactMap(\.dailySummary) {
             let day = Self.dayKey(timestamp: Int(summary.timestamp))
-            // A night's stage minutes (from the same day's sleep file) feed totalSleepMin/deep/rem/light
-            // so the daily row is complete even before a sleep session is read.
             var totalSleep: Double? = nil
             var deep = 0.0, rem = 0.0, light = 0.0, awake = 0.0
-            for s in files.compactMap(\.sleepSession) {
-                if Self.dayKey(timestamp: Int(s.wakeupTime)) == day {
+            for s in files.compactMap(\.sleepSession) where Self.dayKey(timestamp: Int(s.wakeupTime)) == day {
+                let m = SleepStageVocabulary.minutes(s)
+                totalSleep = m.total; deep = m.deep; rem = m.rem; light = m.light; awake = m.awake
+            }
+            if totalSleep == nil {
+                for s in files.compactMap(\.sleepStages) where Self.dayKey(timestamp: Int(s.wakeupTime)) == day {
                     let m = SleepStageVocabulary.minutes(s)
                     totalSleep = m.total; deep = m.deep; rem = m.rem; light = m.light; awake = m.awake
                 }
@@ -76,11 +80,21 @@ enum SmartBand10Importer {
 
         // 2. Sleep sessions ← ACTIVITY_SLEEP (0x08, the RICH file: hypnogram + R-R + HR/SpO2 series) and
         // ACTIVITY_SLEEP_STAGES (0x03, the stage-only file). HRV comes from the night's R-R via HrvCalculator.
+        //
+        // ONE SESSION PER NIGHT, 0x08 PREFERRED: the channel can carry BOTH files for the same night
+        // (the band banks a stage summary in 0x03 and the rich details in 0x08). If their bedTime/wakeupTime
+        // match, inserting both is a harmless upsert overwrite — but the 0x03-derived session carries
+        // restingHr/avgHrv = nil, and `upsertSleepSessions` is `DO UPDATE`, so the 0x03 row CLOBBERS the
+        // 0x08-derived resting-HR and HRV back to NULL (silent loss of exactly the two vitals computed
+        // here). If the band refined the sleep bounds between the two files, inserting both creates a
+        // DUPLICATE night. So: keep 0x08 for a night, skip the 0x03 file for that same night.
+        var nightKeys = Set<String>()
         var sessions: [CachedSleepSession] = []
         for s in files.compactMap(\.sleepSession) {
+            nightKeys.insert(Self.dayKey(timestamp: Int(s.wakeupTime)))
             sessions.append(Self.session(fromSleepSession: s))
         }
-        for s in files.compactMap(\.sleepStages) {
+        for s in files.compactMap(\.sleepStages) where !nightKeys.contains(Self.dayKey(timestamp: Int(s.wakeupTime))) {
             sessions.append(Self.session(fromSleepStages: s))
         }
         changes += try await store.upsertSleepSessions(sessions, deviceId: deviceId)
@@ -92,6 +106,8 @@ enum SmartBand10Importer {
         }
         for summary in files.compactMap(\.dailySummary) {
             let day = Self.dayKey(timestamp: Int(summary.timestamp))
+            // The band's OWN keys — full-field, every scalar the file carries (Metric Explorer +
+            // correlations can scan them even if no dedicated screen reads them).
             add(day, "steps", summary.steps.map(Double.init))
             add(day, "rhr", summary.heartRateResting.map(Double.init))
             add(day, "hr_avg", summary.heartRateAvg.map(Double.init))
@@ -118,6 +134,17 @@ enum SmartBand10Importer {
                 add(day, "hrv_sdnn", hrv.sdnnMs)
                 add(day, "hrv_rmssd", hrv.rmssdMs)
             }
+            // CANONICAL keys the base band UI / Explore actually read (`MetricCatalog` defines
+            // avg_hr/max_hr/vitality under source "xiaomi-band", the catalog Xbox reads by key name for
+            // any source via dayOwner/dailyMetric or the generic series). Written ALONGSIDE the keys
+            // above so the band's measured values surface in the same charts the Mi Fitness import
+            // feeds, regardless of which source id the resolver picks. `active_kcal`/`min_hr` are the
+            // `dailyColumn` names the catalog's Energy/HR rows read.
+            add(day, "avg_hr", summary.heartRateAvg.map(Double.init))
+            add(day, "max_hr", summary.heartRateMax.map(Double.init))
+            add(day, "min_hr", summary.heartRateMin.map(Double.init))
+            add(day, "active_kcal", summary.activeCalories.map(Double.init))
+            add(day, "vitality", summary.vitalityCurrent.map(Double.init))
         }
         for m in files.compactMap(\.manualSamples).flatMap({ $0 }) {
             add(Self.dayKey(timestamp: Int(m.timestamp)), m.type.lowercased(),
@@ -306,6 +333,17 @@ private enum SleepStageVocabulary {
         let rem = Double(s.remMinutes ?? 0)
         let light = Double(s.lightMinutes ?? 0)
         let awake = Double(s.awakeMinutes ?? 0)
+        return (total, deep, rem, light, awake)
+    }
+
+    /// Total / deep / rem / light / awake MINUTES from the stage-only file (`0x03`)'s rollup fields —
+    /// the same shape as `minutes(_: SleepSession)`, so a 0x03-only night still feeds the daily rollup.
+    static func minutes(_ s: SleepStages) -> (total: Double, deep: Double, rem: Double, light: Double, awake: Double) {
+        let total = Double(s.sleepDurationMinutes)
+        let deep = Double(s.deepMinutes)
+        let rem = Double(s.remMinutes)
+        let light = Double(s.lightMinutes)
+        let awake = Double(s.awakeMinutes)
         return (total, deep, rem, light, awake)
     }
 }
