@@ -330,14 +330,12 @@ public final class Session {
         }
     }
 
-    /// Reassemble channel-5 chunks into a file, parse it, and (optionally) emit
-    /// the `8,5` ACK. Returns any packets to write back to the transport.
+    /// Reassemble channel-5 chunks into a file, parse it.
+    /// Never emits the `8,5` file ACK during alpha testing so the watch preserves all flash data.
     private func handleActivityChunk(_ chunk: [UInt8]) -> [Data] {
         guard let fileBytes = activityAssembler.push(chunk) else { return [] }
         let parsed = ActivityParser.parseActivityFile(fileBytes)
         onEvent?(.activityFile(parsed))
-
-        guard !keepActivityData, parsed.error == nil, !parsed.fileId.isNull else { return [] }
-        return (try? [ackActivityFile(parsed.fileId)]) ?? []
+        return []
     }
 }

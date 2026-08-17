@@ -85,6 +85,10 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     /// notify is live). Reset on disconnect / auth retry so a re-connect re-runs the full handshake.
     private var sessionConfigSent = false
     private var isAuthenticated = false
+    /// One-shot auth retry budget. The Band 10 needs TWO auth handshakes (first HMAC always mismatches),
+    /// so this is tripped exactly once per user-initiated `connect`: `connect` re-arms it, `didAuthenticate`
+    /// clears it, `authFailed` trips it to fire the one retry. Deliberately NOT reset on disconnect — the
+    /// force-reconnect teardown must preserve it until the retry session answers.
     private var authRetryAttempted = false
 
     // MARK: - CoreBluetooth state (OWN central, separate from WHOOP)
@@ -216,6 +220,11 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     public func connect(_ id: UUID) {
         stopScan()
         needsPairing = nil
+        // A fresh user-initiated connect gets a fresh one-shot auth retry budget. The Band 10 normally
+        // needs TWO auth handshakes — the first HMAC always mismatches (see `authFailed`) — so every
+        // connect re-arms the retry. `authRetryAttempted` is NOT reset on disconnect (it must survive
+        // the force-reconnect teardown) — only here, on success, and on `stop`.
+        authRetryAttempted = false
         makeSessionIfNeeded()
         // A user-initiated connect arms auto-reconnect for the whole link lifetime. A deliberate teardown
         // (`stop()`) clears this; an involuntary drop (out of range, band reboot) re-issues connect().
@@ -317,13 +326,15 @@ public final class SmartBand10Source: NSObject, ObservableObject {
     }
 
     private func authFailed() {
-        // A failed HMAC on the first attempt is almost always a stale session at the watch — it still
-        // holds encryption keys from a previous link — not a wrong token (the same token works after a
-        // clean reconnect). Drop the link and re-handshake once before declaring the key wrong.
+        // The Band 10 NORMALLY requires TWO consecutive auth handshakes: the first HMAC always mismatches
+        // — the watch is still holding the encryption keys from a previous link — and only the retry
+        // (which re-runs the whole handshake with a fresh session) succeeds. A first mismatch is the
+        // EXPECTED path, not a wrong token. We drop the link and re-handshake once; only if the RETRY also
+        // fails do we declare the key wrong.
         guard !authRetryAttempted else {
             status = "Auth failed — wrong bind token?"
-            needsPairing = "The band rejected the auth key. Double-check the 32-hex Xiaomi bind token for " +
-                           "this band, or log in to your Xiaomi account again."
+            needsPairing = "The band rejected the auth key twice. Double-check the 32-hex Xiaomi bind token " +
+                           "for this band, or log in to your Xiaomi account again."
             // Drop the BLE link so `session` nils out (didDisconnectPeripheral) — with the peripheral left
             // connected, a user who corrects the key and taps Connect would hit makeSessionIfNeeded()'s
             // early return (`session != nil`) and the stale key would never be re-read. Mirrors
@@ -336,14 +347,20 @@ public final class SmartBand10Source: NSObject, ObservableObject {
             if let p = peripheral { central.cancelPeripheralConnection(p) }
             return
         }
+        // First failure: the expected stale-session HMAC mismatch. Re-run the handshake once.
         authRetryAttempted = true
-        status = "Retrying auth…"
-        log("Smart Band 10: auth HMAC mismatch — forcing a clean reconnect to retry")
+        status = "Re-authenticating…"
+        log("Smart Band 10: first auth HMAC mismatch (expected on Band 10) — re-handshaking")
         forceReconnect()
     }
 
     private func forceReconnect() {
-        guard let p = peripheral else { return }
+        let pToReconnect = peripheral ?? reconnectID.flatMap { seenPeripherals[$0] ?? central.retrievePeripherals(withIdentifiers: [$0]).first }
+        guard let p = pToReconnect else {
+            log("Smart Band 10: no live peripheral for auth re-handshake — re-connecting by id")
+            if let id = reconnectID { connect(id) }
+            return
+        }
         session = nil
         framer.reset()
         sessionConfigSent = false
@@ -352,9 +369,12 @@ public final class SmartBand10Source: NSObject, ObservableObject {
         txCharacteristic = nil
         central.cancelPeripheralConnection(p)
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            guard let self, let p = self.peripheral else { return }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self else { return }
+            self.peripheral = p
+            p.delegate = self
             self.makeSessionIfNeeded()
+            self.log("Smart Band 10: re-connecting for auth retry...")
             self.central.connect(p, options: nil)
         }
     }
@@ -764,7 +784,6 @@ extension SmartBand10Source: @preconcurrency CBCentralManagerDelegate {
         session = nil
         framer.reset()
         sessionConfigSent = false
-        authRetryAttempted = false
         rxCharacteristic = nil
         txCharacteristic = nil
         batteryCharacteristic = nil

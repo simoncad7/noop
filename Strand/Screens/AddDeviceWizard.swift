@@ -25,6 +25,10 @@ struct AddDeviceWizard: View {
     @EnvironmentObject var live: LiveState
     let onClose: () -> Void
 
+    /// The shared strap-log sink, kept so the pairing helpers (`logPairing`) can emit into the same debug
+    /// bundle the discovery scans use. Matches the `wizardLog` closure built in `init`.
+    private let strapLog: (String) -> Void
+
     // MARK: Flow
 
     /// What the user is adding. Drives the prep copy AND which scan/register path runs.
@@ -74,7 +78,7 @@ struct AddDeviceWizard: View {
         }
     }
 
-    enum Step { case type, prep, pick, confirm }
+    enum Step { case type, prep, pick, pairing, confirm }
 
     /// The Oura factory-reset-and-adopt sub-flow's own step machine (section 2 of the onboarding UX spec).
     /// The Oura type does NOT use the generic prep/pick/confirm shape: it owns this machine, entered from the
@@ -89,6 +93,13 @@ struct AddDeviceWizard: View {
 
     @State private var step: Step = .type
     @State private var type: DeviceType?
+    /// TRUE while the step machine is in `.pairing` — reached by tapping a band on the pick step, and
+    /// exited when auth succeeds (`sb10Scanner.connected`) or fails. Holds the `.pairing` case open so the
+    /// live source's auth progress can change it — the state object does NOT mutate the wizard's step.
+    @State private var sb10Pairing = false
+    /// Cancelled by the user mid-pairing (tapped a different band / minimised). Forces the pending
+    /// connect to back out immediately; reset on the next pick.
+    @State private var sb10PairingCancelled = false
     /// The Oura sub-flow step (only meaningful while `type == .oura`). Reset to `.gate` on each Oura entry.
     @State private var ouraStep: OuraStep = .gate
     /// The destructive "Take over this ring?" confirm alert (the SECOND irreversible gate, after the consent
@@ -111,6 +122,14 @@ struct AddDeviceWizard: View {
     @State private var pickedOura: (ring: OuraLiveSource.DiscoveredRing, gen: OuraRingGen)?
     /// An EXPERIMENTAL Xiaomi Smart Band 10 picked from the SmartBand10Source scan.
     @State private var pickedSB10: SmartBand10Source.DiscoveredDevice?
+    /// `@Published status` of the **real** Smart Band 10 source, staged while pairing so the `.pairing`
+    /// face can show live handshake progress ("Initializing SPP…", "Re-authenticating…", "Authenticated").
+    /// The face lives in this struct while the source lives in `@StateObject` above; SwiftUI forces the
+    /// mutation order (`change` → face re-render) so claiming the status here is safe.
+    @State private var sb10PairingStatus = "Connecting…"
+    /// True while the `.pairing` handshake is known to have completed an auth (proves the "Phase 3" success
+    /// copy to the face). The source's own `connected` state owns the actual gating — this only drives text.
+    @State private var sb10PairingDone = false
 
     @State private var nameDraft = ""
     /// After registering, ask whether to make the new device active.
@@ -144,9 +163,11 @@ struct AddDeviceWizard: View {
     /// its `@Published discovered` / `scanning` / `needsPairing` while scanning. The chosen ring is adopted
     /// for real on `finishAdd`, where the registered `PairedDevice` carries the ring generation. Built once.
     @StateObject private var ouraScanner: OuraLiveSource
-    /// Discovery-only EXPERIMENTAL Smart Band 10 scanner. `feedsLive: false`, no-op persist, no auth key
-    /// (discovery never authenticates), so the wizard only reads its `discovered` / `scanning`. The chosen
-    /// band is paired for real on `finishAdd`, where the typed bind token is stored per-device. Built once.
+    /// Smart Band 10 scanner, built in discovery-only mode (`feedsLive: false`, no-op persist, no-op
+    /// battery). It DOES carry a real `authKey` closure that re-reads the user's typed bind token live
+    /// (validated to 16 bytes), so once a band is tapped the same source performs the real pairing here in
+    /// the wizard. The token is only persisted per-device on `finishAdd`; this closure hands it reps as raw
+    /// bytes for the auth handshake. Built once.
     @StateObject private var sb10Scanner: SmartBand10Source
 
     /// - Parameter startAt: DEBUG-only deep-link into a specific (type, step) so a seeded simulator build
@@ -172,6 +193,7 @@ struct AddDeviceWizard: View {
                 live.append(log: "[\(AppModel.logTimeFormatter.string(from: Date()))] \(line)")
             }
         }
+        self.strapLog = wizardLog
         _hrScanner = StateObject(wrappedValue: StandardHRSource(
             live: live, deviceId: "scan-preview", persist: { _ in }, log: wizardLog))
         _ftmsScanner = StateObject(wrappedValue: FTMSSource(live: live, log: wizardLog, feedsLive: false))
@@ -183,8 +205,14 @@ struct AddDeviceWizard: View {
         _ouraScanner = StateObject(wrappedValue: OuraLiveSource(
             live: live, deviceId: "scan-preview", ringGen: .gen3, authKey: { nil },
             persist: { _ in }, log: wizardLog, feedsLive: false))
+        // Smart Band 10 scanner: discovery-only (`feedsLive: false`, no-op persist/battery) but with a REAL
+        // authKey closure so a band tapped on the pick step can pair for real here in the wizard. The source
+        // calls the accessor from the main actor; typed bind-token bytes come from a shared box (the source
+        // reads it on demand, so an edit to the token field is reflected immediately).
+        let sb10KeyBox = SmartBand10KeyBox.shared
         _sb10Scanner = StateObject(wrappedValue: SmartBand10Source(
-            live: live, deviceId: "scan-preview", persist: { _ in }, log: wizardLog, feedsLive: false))
+            live: live, deviceId: "scan-preview", persist: { _ in }, log: wizardLog, feedsLive: false,
+            authKey: { sb10KeyBox.bytes }))
     }
 
     var body: some View {
@@ -202,6 +230,7 @@ struct AddDeviceWizard: View {
                         case .type:    typeStep
                         case .prep:    prepStep
                         case .pick:    pickStep
+                        case .pairing: pairingStep
                         case .confirm: confirmStep
                         }
                     }
@@ -212,6 +241,34 @@ struct AddDeviceWizard: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(StrandPalette.surfaceBase)
+        // Keep the scanner's auth-key box in sync with the token field (invisible, zero-footprint marker).
+        sb10AuthKeySync
+        // Pairing progress: the Smart Band 10 needs the real auth handshake to complete before the user may
+        // finish adding it. The state-object source does not write to the wizard's `step`, so while `.pairing`
+        // is open the wizard mirrors the live source — on success it moves to confirm (the only way forward),
+        // and a needs-pairing failure moves back to pick so the user can correct the token and try again.
+        .onChange(of: sb10Scanner.connected) { connected in
+            guard type == .smartBand10, sb10Pairing else { return }
+            sb10PairingStatus = sb10Scanner.status
+            if connected {
+                sb10PairingDone = true
+                // Small grace so the face can paint the authenticated state before we advance to confirm.
+                sb10Pairing = false
+                step = .confirm
+                sb10PairingDone = false
+                logPairing("connected")
+            }
+        }
+        .onChange(of: sb10Scanner.needsPairing) { msg in
+            guard type == .smartBand10, sb10Pairing, msg != nil else { return }
+            sb10PairingCancelled = true
+            sb10Pairing = false
+            stopPairing()
+            step = .pick
+            sb10PairingCancelled = false
+            sb10PairingDone = false
+            logPairing("needsPairing: \(msg!)")
+        }
         // Stop whichever scan is live whenever the sheet goes away (belt-and-braces alongside the
         // per-transition stops below) so neither central keeps scanning after dismiss.
         .onDisappear { stopAllScans() }
@@ -252,6 +309,16 @@ struct AddDeviceWizard: View {
     }
 
     // MARK: Header
+
+    /// Keep the shared bind-token box in lock-step with the token field so the scanner's authKey closure
+    /// always reads the current bytes (the box lives outside `@State`, which `init`-captured closures can't
+    /// hold). Only a validated 16-byte token is ever handed to the auth handshake; the box mirrors whatever
+    /// `sb10KeyBytes` computes from the draft at this instant.
+    private var sb10AuthKeySync: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: sb10KeyDraft) { SmartBand10KeyBox.shared.bytes = sb10KeyBytes }
+    }
 
     private var header: some View {
         HStack(spacing: 12) {
@@ -309,6 +376,7 @@ struct AddDeviceWizard: View {
         case .type:    return "Add a device"
         case .prep:    return LocalizedStringKey(type.map(typeTitle) ?? String(localized: "Add a device"))
         case .pick:    return "Pick your device"
+        case .pairing: return "Pairing with your band"
         case .confirm: return "Name & confirm"
         }
     }
@@ -326,6 +394,7 @@ struct AddDeviceWizard: View {
         case .type:    return "What are you adding?"
         case .prep:    return "Get it ready, then scan."
         case .pick:    return "Tap the one that's yours."
+        case .pairing: return "Keep the band on your wrist until it pairs."
         case .confirm: return nil
         }
     }
@@ -1169,12 +1238,14 @@ struct AddDeviceWizard: View {
                 }
             } else if type == .smartBand10 {
                 // EXPERIMENTAL Smart Band 10 pick list (the band advertises a Xiaomi/Band/Smart name).
+                // Tapping a band does NOT finish the add — the real auth handshake runs first (in `.pairing`),
+                // and only its success advances to the confirm step.
                 SmartBand10PickList(scanner: sb10Scanner) { dev in
                     pickedSB10 = dev
                     clearOtherPicks(except: type)
                     nameDraft = dev.name
                     sb10Scanner.stopScan()
-                    step = .confirm
+                    beginPairing(dev)
                 } onRescan: {
                     sb10Scanner.scan()
                 }
@@ -1189,6 +1260,52 @@ struct AddDeviceWizard: View {
                 } onRescan: {
                     hrScanner.scan()
                 }
+            }
+        }
+    }
+
+    /// The Smart Band 10 pairing face. The add flow BLOCKS here once a band is tapped: the real auth
+    /// handshake must succeed before the user can finish. Live text comes from `sb10Scanner`'s own `status`
+    /// (@MainActor `@Published`); a needs-pairing failure returns the wizard to the pick step so the token
+    /// can be corrected and the tap retried. This face cannot advance on its own — the `.pairing`-phase
+    /// `.onChange` handlers own the transitions.
+    @ViewBuilder private var pairingStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                ProgressView()
+                    .tint(StrandPalette.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pickedSB10?.name ?? type.map(typeTitle) ?? String(localized: "Smart Band 10"))
+                        .font(StrandFont.headline)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text(sb10PairingStatus)
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                }
+                Spacer()
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frostedCardSurface(cornerRadius: 12)
+
+            Text(sb10PairingDone
+                 ? String(localized: "Authenticated with your band. Ready to finish adding it.")
+                 : String(localized: "Pairing with your band. Keep it on your wrist. This normally takes a few seconds — the band re-authenticates twice, and the first exchange is expected to fail as it clears the previous session."))
+                .font(StrandFont.body)
+                .foregroundStyle(StrandPalette.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if sb10PairingDone {
+                Button("Continue") {
+                    // The success `.onChange` normally advances straight to confirm; this is a UI safeguard
+                    // in case a future refactor reorders the transitions.
+                    sb10Pairing = false
+                    sb10PairingDone = false
+                    step = .confirm
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(StrandPalette.accent)
+                .frame(maxWidth: .infinity)
             }
         }
     }
@@ -1287,6 +1404,18 @@ struct AddDeviceWizard: View {
         case .type:    break
         case .prep:    step = .type
         case .pick:    stopAllScans(); step = .prep
+        case .pairing:
+            // User backs out mid-auth: flag the pending connect to cancel (the live source may be between
+            // handshake steps), tear the link down, and return to the pick list still showing the band. The
+            // next tap starts a fresh pairing. No scan restart here — resuming the list is enough; the band
+            // is already in `discovered` (the source re-finds it over BLE on the next connect).
+            sb10PairingCancelled = true
+            sb10Pairing = false
+            sb10PairingDone = false
+            sb10Scanner.stop()          // also cancels the pending connect + peripheral
+            if type != nil { stopAllScans() }
+            pickedSB10 = nil
+            step = .pick
         case .confirm:
             // Re-enter the pick step and restart its scan so the user can choose a different device.
             if let type { startScan(for: type) }
@@ -1346,6 +1475,43 @@ struct AddDeviceWizard: View {
         huamiScanner.stopScan()
         ouraScanner.stop()
         sb10Scanner.stop()
+    }
+
+    // MARK: Smart Band 10 pairing (real auth before the add can finish)
+
+    /// Enter the authenticating (`.pairing`) step for a tapped band. Discovery cannot pair — only the real
+    /// handshake proves the token, and the user may not finish the add until it succeeds. The state object
+    /// cannot address the wizard's `step`, so we kick the connect ourselves; its `connected` /
+    /// `needsPairing` `.onChange` handlers then move the wizard forward (confirm) or back (pick).
+    private func beginPairing(_ dev: SmartBand10Source.DiscoveredDevice) {
+        guard let key = sb10KeyBytes else {
+            // Should be impossible (the Scan gate already checks this), but never start an auth we know
+            // cannot succeed.
+            pickedSB10 = nil
+            step = .pick
+            return
+        }
+        sb10PairingCancelled = false
+        sb10PairingDone = false
+        sb10PairingStatus = "Connecting…"
+        sb10Pairing = true
+        step = .pairing
+        logPairing("begin pairing \(dev.name) (key \(key.count) bytes)")
+        // Establish a fresh session from the token, then connect to the tapped band. The source re-reads the
+        // token from the key box, so a user edit to the token field before Scan is already reflected here.
+        // (makeSessionIfNeeded() is reset on the source's side by stop(); we just connect.)
+        sb10Scanner.connect(dev.id)
+    }
+
+    /// Tear down an in-flight or just-failed SB10 pairing. Guards against double-stop (the `.onChange` for
+    /// needsPairing drives this on the failure path; back from `.pairing` drives it on the user path).
+    private func stopPairing() {
+        // Nothing else to tear down here: stop() already cancels the pending connect + peripheral.
+        // Keeping the helper name explicit so the pairing entry/exit reads clearly at call sites.
+    }
+
+    private func logPairing(_ line: String) {
+        strapLog("Smart Band 10 pairing: \(line)")
     }
 
     /// Build the right `PairedDevice` for the chosen path, register it, optionally activate, then close.
@@ -1713,6 +1879,16 @@ private struct HuamiPickList: View {
             }
         }
     }
+}
+
+/// A tiny main-actor box that holds the Smart Band 10 bind-token bytes for the wizard's scanner. The
+/// `authKey` closure is created in `init` and cannot capture `@State`, so the token is shared through this
+/// box instead; the wizard syncs it from the token field (via `sb10AuthKeySync`).
+@MainActor
+final class SmartBand10KeyBox {
+    static let shared = SmartBand10KeyBox()
+    var bytes: Data? = nil
+    private init() {}
 }
 
 /// The EXPERIMENTAL Smart Band 10 pick step. Observes the discovery-only `SmartBand10Source` and lists

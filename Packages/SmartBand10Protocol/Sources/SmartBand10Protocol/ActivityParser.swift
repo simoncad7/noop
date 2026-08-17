@@ -97,7 +97,10 @@ public enum ActivityParser {
                 if cp.has(0) { sample.distanceCm = cp.get(0, 16) * 100 }
             }
             if cp.nextGroup(8) {
-                if cp.has(0) { sample.heartRate = UInt8(cp.get(0, 8)) }
+                if cp.has(0) {
+                    let hr = UInt8(cp.get(0, 8))
+                    if hr >= 10 { sample.heartRate = hr }
+                }
             }
             if cp.nextGroup(8) {
                 if cp.has(0) { sample.energy = UInt8(cp.get(0, 8)) }
@@ -193,12 +196,12 @@ public enum ActivityParser {
         switch name {
         case "steps": s.steps = value
         case "active_calories": s.activeCalories = UInt16(value)
-        case "hr_resting": s.heartRateResting = UInt8(value)
-        case "hr_max": s.heartRateMax = UInt8(value)
+        case "hr_resting": if value >= 10 { s.heartRateResting = UInt8(value) }
+        case "hr_max": if value >= 10 { s.heartRateMax = UInt8(value) }
         case "hr_max_ts": s.heartRateMaxTimestamp = value
-        case "hr_min": s.heartRateMin = UInt8(value)
+        case "hr_min": if value >= 10 { s.heartRateMin = UInt8(value) }
         case "hr_min_ts": s.heartRateMinTimestamp = value
-        case "hr_avg": s.heartRateAvg = UInt8(value)
+        case "hr_avg": if value >= 10 { s.heartRateAvg = UInt8(value) }
         case "stress_avg": s.stressAvg = UInt8(value)
         case "stress_max": s.stressMax = UInt8(value)
         case "stress_min": s.stressMin = UInt8(value)

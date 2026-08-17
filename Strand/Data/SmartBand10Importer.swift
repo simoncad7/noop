@@ -64,7 +64,7 @@ enum SmartBand10Importer {
                 remMin: rem > 0 ? rem : nil,
                 lightMin: light > 0 ? light : nil,
                 disturbances: nil,
-                restingHr: summary.heartRateResting.map(Int.init),
+                restingHr: summary.heartRateResting.flatMap { $0 >= 10 ? Int($0) : nil },
                 avgHrv: hrvByDay[day]?.rmssdMs,
                 recovery: nil,
                 strain: nil,
@@ -109,10 +109,10 @@ enum SmartBand10Importer {
             // The band's OWN keys — full-field, every scalar the file carries (Metric Explorer +
             // correlations can scan them even if no dedicated screen reads them).
             add(day, "steps", summary.steps.map(Double.init))
-            add(day, "rhr", summary.heartRateResting.map(Double.init))
-            add(day, "hr_avg", summary.heartRateAvg.map(Double.init))
-            add(day, "hr_min", summary.heartRateMin.map(Double.init))
-            add(day, "hr_max", summary.heartRateMax.map(Double.init))
+            add(day, "rhr", summary.heartRateResting.flatMap { $0 >= 10 ? Double($0) : nil })
+            add(day, "hr_avg", summary.heartRateAvg.flatMap { $0 >= 10 ? Double($0) : nil })
+            add(day, "hr_min", summary.heartRateMin.flatMap { $0 >= 10 ? Double($0) : nil })
+            add(day, "hr_max", summary.heartRateMax.flatMap { $0 >= 10 ? Double($0) : nil })
             add(day, "spo2", summary.spo2Avg.map(Double.init))
             add(day, "spo2_min", summary.spo2Min.map(Double.init))
             add(day, "spo2_max", summary.spo2Max.map(Double.init))
@@ -140,9 +140,9 @@ enum SmartBand10Importer {
             // above so the band's measured values surface in the same charts the Mi Fitness import
             // feeds, regardless of which source id the resolver picks. `active_kcal`/`min_hr` are the
             // `dailyColumn` names the catalog's Energy/HR rows read.
-            add(day, "avg_hr", summary.heartRateAvg.map(Double.init))
-            add(day, "max_hr", summary.heartRateMax.map(Double.init))
-            add(day, "min_hr", summary.heartRateMin.map(Double.init))
+            add(day, "avg_hr", summary.heartRateAvg.flatMap { $0 >= 10 ? Double($0) : nil })
+            add(day, "max_hr", summary.heartRateMax.flatMap { $0 >= 10 ? Double($0) : nil })
+            add(day, "min_hr", summary.heartRateMin.flatMap { $0 >= 10 ? Double($0) : nil })
             add(day, "active_kcal", summary.activeCalories.map(Double.init))
             add(day, "vitality", summary.vitalityCurrent.map(Double.init))
         }
@@ -167,6 +167,7 @@ enum SmartBand10Importer {
             if let series = s.heartRateSeries, let first = series.firstRecordTime,
                !series.samples.isEmpty {
                 for (i, bpm) in series.samples.enumerated() {
+                    guard bpm >= 10 else { continue }
                     streams.hr.append(HRSample(ts: Int(first) + i * 60, bpm: Int(bpm)))
                 }
             }
@@ -185,7 +186,7 @@ enum SmartBand10Importer {
         // Day: minute-resolution HR from the daily-details file (ACTIVITY_DAILY detail 0).
         for d in files.compactMap(\.dailyDetails) {
             for sample in d.samples {
-                if let bpm = sample.heartRate {
+                if let bpm = sample.heartRate, bpm >= 10 {
                     streams.hr.append(HRSample(ts: Int(sample.timestamp), bpm: Int(bpm)))
                 }
             }
@@ -209,11 +210,12 @@ enum SmartBand10Importer {
         let endTs = Int(s.wakeupTime)
         let segs = stageSegments(s)
         let hrv = Self.hrv(for: s)
+        let minRestingHr = s.heartRateSeries?.samples.filter { $0 >= 10 }.min().map(Int.init)
         return CachedSleepSession(
             startTs: startTs,
             endTs: endTs,
             efficiency: efficiency(segs: segs, start: startTs, end: endTs),
-            restingHr: s.heartRateSeries?.samples.min().map(Int.init),
+            restingHr: minRestingHr,
             avgHrv: hrv?.rmssdMs,
             stagesJSON: segs.isEmpty ? nil : Self.stagesJSON(segs))
     }

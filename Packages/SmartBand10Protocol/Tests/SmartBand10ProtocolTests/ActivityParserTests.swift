@@ -162,4 +162,39 @@ final class ActivityParserTests: XCTestCase {
         XCTAssertEqual(first.heartRate, .some(59))
         XCTAssertEqual(first.activeCalories, .some(1))
     }
+
+    func testDailySummaryRejectsLowHeartRateValues() {
+        let fileId = ActivityFileId(timestamp: 1786572000, timezone: 0, version: 5, type: 0, subtype: 0x00, detailType: 1)
+        var data: [UInt8] = fileId.bytes
+        data.append(0x00) // padding
+        // Header: 4 bytes bitmask (all slots valid)
+        data.append(contentsOf: [0xFF, 0xFF, 0xFF, 0xFF])
+        // Slot 0: steps (i32) -> 100
+        data.append(contentsOf: [100, 0, 0, 0])
+        // Slot 1: active_calories (u16) -> 50
+        data.append(contentsOf: [50, 0])
+        // Slot 2: nil (u8)
+        data.append(0)
+        // Slot 3: hr_resting (u8) -> 0 (should be rejected -> nil)
+        data.append(0)
+        // Slot 4: hr_max (u8) -> 120 (valid)
+        data.append(120)
+        // Slot 5: hr_max_ts (i32) -> 1786572100
+        data.append(contentsOf: [0x50, 0x00, 0x00, 0x00])
+        // Slot 6: hr_min (u8) -> 5 (should be rejected -> nil)
+        data.append(5)
+        // Slot 7: hr_min_ts (i32) -> 0
+        data.append(contentsOf: [0, 0, 0, 0])
+        // Slot 8: hr_avg (u8) -> 9 (should be rejected -> nil)
+        data.append(9)
+        // Remaining slots padding so buffer doesn't underrun
+        data.append(contentsOf: [UInt8](repeating: 0, count: 100))
+
+        let parsed = ActivityParser.parseDailySummary(data, fileId: fileId)
+        XCTAssertNotNil(parsed)
+        XCTAssertNil(parsed?.heartRateResting, "RHR < 10 bpm must be rejected and stay nil")
+        XCTAssertNil(parsed?.heartRateMin, "Min HR < 10 bpm must be rejected and stay nil")
+        XCTAssertNil(parsed?.heartRateAvg, "Avg HR < 10 bpm must be rejected and stay nil")
+        XCTAssertEqual(parsed?.heartRateMax, 120, "Valid HR >= 10 bpm should be retained")
+    }
 }
